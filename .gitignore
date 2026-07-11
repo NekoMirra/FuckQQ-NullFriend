@@ -17,3 +17,5 @@ out/
 .cxx/
 *.hprof
 .kotlin/
+
+local.properties

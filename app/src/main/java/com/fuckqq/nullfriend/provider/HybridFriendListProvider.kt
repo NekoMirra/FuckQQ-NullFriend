@@ -280,7 +280,7 @@ class DbFriendSource(
         for (dir in dirs) {
             if (!dir.exists() || !dir.isDirectory) continue
             dir.listFiles()
-                ?.filter { it.isFile && it.extension in listOf("db", "db-journal").let { ext -> it.name.endsWith(".db") } }
+                ?.filter { it.isFile && it.name.endsWith(".db") }
                 ?.filter { f ->
                     val n = f.name.lowercase()
                     nameHints.any { n.contains(it) } || n.contains(owner) || n.startsWith("qq")
@@ -309,12 +309,8 @@ class DbFriendSource(
             }
             for (table in tables) {
                 val tl = table.lowercase()
-                if (tl.contains("android_") || tl.contains("sqlite_")) continue
-                if (!(tl.contains("friend") || tl.contains("buddy") || tl.contains("card") ||
-                        tl.contains("contact") || tl.contains("troop_member").not() && tl.contains("uin"))
-                ) {
-                    if (!tl.contains("friend") && !tl.contains("buddy")) continue
-                }
+                if (tl.contains("android_") || tl.startsWith("sqlite_")) continue
+                if (!tl.contains("friend") && !tl.contains("buddy")) continue
                 readTable(db, table, out)
             }
         } catch (t: Throwable) {
