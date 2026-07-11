@@ -7,355 +7,445 @@ import com.fuckqq.nullfriend.domain.FriendSource
 import com.fuckqq.nullfriend.util.Log
 import com.fuckqq.nullfriend.util.UinUtil
 import de.robv.android.xposed.XposedHelpers
-import java.io.File
+import java.lang.reflect.Field
+import java.lang.reflect.Modifier
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Hybrid provider: try reflective QQ APIs, then local DB heuristics.
- * Version-specific signatures may need updates after QQ upgrades.
+ * Friend list access inspired by QAuxiliary ExfriendManager / ManagerHelper:
+ * - AppRuntime from MobileQQ
+ * - FriendsManager via getManager(50) (or FRIENDS_MANAGER constant)
+ * - ConcurrentHashMap of com.tencent.mobileqq.data.Friends
+ * - Optional FriendListHandler refresh request
+ *
+ * Does NOT copy QAuxiliary AGPL source; reimplements the public reverse-engineering pattern.
  */
 class HybridFriendListProvider(
     private val context: Context,
     private val hostClassLoader: ClassLoader?
 ) : FriendListProvider {
 
-    private val api = ApiFriendSource(hostClassLoader)
-    private val db = DbFriendSource(context, hostClassLoader)
+    private val cl: ClassLoader
+        get() = hostClassLoader
+            ?: context.classLoader
+            ?: throw IllegalStateException("No ClassLoader")
 
-    override fun currentOwnerUin(): String? =
-        api.currentOwnerUin() ?: db.currentOwnerUin()
-
-    override fun fetch(): Result<FriendListResult> {
-        val apiResult = api.fetch()
-        if (apiResult.isSuccess) return apiResult
-        Log.w("API friend fetch failed: ${apiResult.exceptionOrNull()?.message}")
-        val dbResult = db.fetch()
-        if (dbResult.isSuccess) return dbResult
-        val msg =
-            "API: ${apiResult.exceptionOrNull()?.message}; DB: ${dbResult.exceptionOrNull()?.message}"
-        return Result.failure(IllegalStateException(msg))
-    }
-}
-
-class ApiFriendSource(private val cl: ClassLoader?) : FriendListProvider {
-
-    override fun currentOwnerUin(): String? {
-        cl ?: return null
-        return resolveOwnerUin(cl)
-    }
+    override fun currentOwnerUin(): String? = runCatching { resolveOwnerUin() }.getOrNull()
 
     override fun fetch(): Result<FriendListResult> {
-        val loader = cl ?: return Result.failure(IllegalStateException("No classLoader"))
         return runCatching {
-            val owner = resolveOwnerUin(loader)
-                ?: throw IllegalStateException("Cannot resolve owner uin")
-            val friends = loadFriendsViaReflection(loader, owner)
-            FriendListResult(
-                ownerUin = owner,
-                friends = friends,
-                fetchedAt = System.currentTimeMillis(),
-                source = FriendSource.API
+            val owner = resolveOwnerUin()
+                ?: throw IllegalStateException("Cannot resolve account uin")
+            // Prefer memory FriendsManager (same as QA init-from-internal)
+            val fromMgr = loadFromFriendsManager()
+            if (fromMgr != null && fromMgr.isNotEmpty()) {
+                Log.i("Friends from FriendsManager: ${fromMgr.size}")
+                return@runCatching FriendListResult(
+                    ownerUin = owner,
+                    friends = fromMgr,
+                    fetchedAt = System.currentTimeMillis(),
+                    source = FriendSource.API
+                )
+            }
+            // Try request refresh then re-read
+            requestFriendListRefresh()
+            Thread.sleep(800)
+            val again = loadFromFriendsManager()
+            if (again != null && again.isNotEmpty()) {
+                Log.i("Friends after refresh: ${again.size}")
+                return@runCatching FriendListResult(
+                    ownerUin = owner,
+                    friends = again,
+                    fetchedAt = System.currentTimeMillis(),
+                    source = FriendSource.API
+                )
+            }
+            // NT / service path
+            val fromService = loadFromFriendDataService()
+            if (fromService != null) {
+                Log.i("Friends from IFriendDataService-like: ${fromService.size}")
+                return@runCatching FriendListResult(
+                    ownerUin = owner,
+                    friends = fromService,
+                    fetchedAt = System.currentTimeMillis(),
+                    source = FriendSource.API
+                )
+            }
+            // Cached network chunks (if DeletionObserver-style hook filled it)
+            val cached = FriendListRespCache.snapshot()
+            if (cached.isNotEmpty()) {
+                Log.i("Friends from GetFriendListResp cache: ${cached.size}")
+                return@runCatching FriendListResult(
+                    ownerUin = owner,
+                    friends = cached,
+                    fetchedAt = System.currentTimeMillis(),
+                    source = FriendSource.API
+                )
+            }
+            throw IllegalStateException(
+                "FriendsManager empty and no service/cache. " +
+                    "Open QQ 联系人 tab once, then refresh. " +
+                    "mgr=${fromMgr?.size ?: -1}"
             )
         }
     }
 
-    companion object {
-        fun resolveOwnerUin(cl: ClassLoader): String? {
-            val candidates = listOf(
-                "com.tencent.common.app.BaseApplicationImpl",
-                "mqq.app.MobileQQ",
-                "com.tencent.mobileqq.app.QQAppInterface"
-            )
-            for (className in candidates) {
-                try {
-                    val clazz = XposedHelpers.findClassIfExists(className, cl) ?: continue
-                    when (className) {
-                        "mqq.app.MobileQQ", "com.tencent.common.app.BaseApplicationImpl" -> {
-                            val inst = runCatching {
-                                XposedHelpers.callStaticMethod(clazz, "getMobileQQ")
-                            }.getOrNull() ?: runCatching {
-                                XposedHelpers.getStaticObjectField(clazz, "sApplication")
-                            }.getOrNull() ?: runCatching {
-                                XposedHelpers.callStaticMethod(clazz, "getContext")
-                            }.getOrNull()
-                            if (inst != null) {
-                                val uin = extractUinFromApp(inst)
-                                if (uin != null) return uin
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
-                }
+    private fun resolveOwnerUin(): String? {
+        val rt = getAppRuntime() ?: return null
+        // Prefer getLongAccountUin (QA)
+        runCatching {
+            val v = XposedHelpers.callMethod(rt, "getLongAccountUin")
+            val n = when (v) {
+                is Long -> v.toString()
+                is Number -> v.toLong().toString()
+                else -> v?.toString()
             }
-            // Common field patterns on runtime app
-            try {
-                val mobileQQ = XposedHelpers.findClassIfExists("mqq.app.MobileQQ", cl)
-                if (mobileQQ != null) {
-                    val app = XposedHelpers.callStaticMethod(mobileQQ, "getMobileQQ")
-                    val waitApp = XposedHelpers.callMethod(app, "waitAppRuntime", null as Any?)
-                    val uin = XposedHelpers.callMethod(waitApp, "getAccount") as? String
-                    val n = UinUtil.normalize(uin)
-                    if (n != null) return n
-                }
-            } catch (t: Throwable) {
-                Log.d("resolveOwnerUin: ${t.message}")
-            }
-            return null
+            UinUtil.normalize(n)?.let { return it }
         }
-
-        private fun extractUinFromApp(app: Any): String? {
-            return try {
-                val runtime = XposedHelpers.callMethod(app, "waitAppRuntime", null as Any?)
-                UinUtil.normalize(XposedHelpers.callMethod(runtime, "getAccount") as? String)
-            } catch (_: Throwable) {
-                null
-            }
+        runCatching {
+            UinUtil.normalize(XposedHelpers.callMethod(rt, "getAccount") as? String)?.let { return it }
         }
+        return null
+    }
 
-        private fun loadFriendsViaReflection(cl: ClassLoader, owner: String): List<FriendEntry> {
-            // NT / classic managers — best-effort; expand with DexKit on device.
-            val managerNames = listOf(
-                "com.tencent.mobileqq.friend.api.IFriendDataService",
-                "com.tencent.mobileqq.app.FriendsManager",
-                "com.tencent.mobileqq.activity.contacts.base.FriendListInfo"
-            )
-            for (name in managerNames) {
-                try {
-                    val clazz = XposedHelpers.findClassIfExists(name, cl) ?: continue
-                    Log.d("Trying friend manager $name")
-                    // Service-style: getService from runtime
-                    val mobileQQ = XposedHelpers.findClass("mqq.app.MobileQQ", cl)
-                    val app = XposedHelpers.callStaticMethod(mobileQQ, "getMobileQQ")
-                    val runtime = XposedHelpers.callMethod(app, "waitAppRuntime", null as Any?)
-                    val service = runCatching {
-                        XposedHelpers.callMethod(runtime, "getRuntimeService", clazz, "all")
-                    }.getOrNull()
-                    if (service != null) {
-                        val list = invokeFriendList(service)
-                        if (list != null) return list
-                    }
-                    val mgr = runCatching {
-                        XposedHelpers.callMethod(runtime, "getManager", 50)
-                    }.getOrNull()
-                    if (mgr != null && mgr.javaClass.name.contains("Friend", ignoreCase = true)) {
-                        val list = invokeFriendList(mgr)
-                        if (list != null) return list
-                    }
-                } catch (t: Throwable) {
-                    Log.d("manager $name: ${t.message}")
-                }
+    private fun getAppRuntime(): Any? {
+        val loader = cl
+        // MobileQQ.sMobileQQ.mAppRuntime (QA AppRuntimeHelper)
+        try {
+            val mobileQQ = XposedHelpers.findClass("mqq.app.MobileQQ", loader)
+            val sMobileQQ = runCatching {
+                XposedHelpers.getStaticObjectField(mobileQQ, "sMobileQQ")
+            }.getOrNull() ?: runCatching {
+                XposedHelpers.callStaticMethod(mobileQQ, "getMobileQQ")
+            }.getOrNull()
+            if (sMobileQQ != null) {
+                val f = mobileQQ.getDeclaredField("mAppRuntime").apply { isAccessible = true }
+                val rt = f.get(sMobileQQ)
+                if (rt != null) return rt
             }
-            throw IllegalStateException("No friend API available for this QQ version (owner=$owner)")
+        } catch (t: Throwable) {
+            Log.d("mAppRuntime: ${t.message}")
         }
+        try {
+            val mobileQQ = XposedHelpers.findClass("mqq.app.MobileQQ", loader)
+            val app = XposedHelpers.callStaticMethod(mobileQQ, "getMobileQQ")
+            return XposedHelpers.callMethod(app, "waitAppRuntime", null as Any?)
+        } catch (t: Throwable) {
+            Log.d("waitAppRuntime: ${t.message}")
+        }
+        return null
+    }
 
-        private fun invokeFriendList(manager: Any): List<FriendEntry>? {
-            val methodNames = listOf(
-                "getAllFriends",
-                "getFriendList",
-                "getAllFriendList",
-                "getFriends",
-                "getAllBuddyList"
+    private fun getQQAppInterface(): Any? {
+        val rt = getAppRuntime() ?: return null
+        // On classic QQ main process, runtime IS QQAppInterface
+        val name = rt.javaClass.name
+        if (name.contains("QQAppInterface") || name.contains("AppRuntime")) {
+            return rt
+        }
+        return rt
+    }
+
+    private fun getFriendsManager(): Any? {
+        val app = getQQAppInterface() ?: return null
+        // Try QQManagerFactory.FRIENDS_MANAGER
+        var id: Int? = null
+        try {
+            val factory = XposedHelpers.findClassIfExists(
+                "com.tencent.mobileqq.app.QQManagerFactory",
+                cl
             )
-            for (m in methodNames) {
-                try {
-                    val raw = XposedHelpers.callMethod(manager, m) ?: continue
-                    val parsed = coerceToFriends(raw)
-                    if (parsed != null) return parsed
-                } catch (_: Throwable) {
-                }
-            }
-            // zero-arg get methods returning List
-            manager.javaClass.methods
-                .filter {
-                    it.parameterTypes.isEmpty() &&
-                        (List::class.java.isAssignableFrom(it.returnType) ||
-                            it.returnType.name.contains("List"))
-                }
-                .forEach { method ->
+            if (factory != null) {
+                for (fname in listOf("FRIENDS_MANAGER", "FRIEND_MANAGER", "BUDDY_LIST_MANAGER")) {
                     try {
-                        val raw = method.invoke(manager) ?: return@forEach
-                        val parsed = coerceToFriends(raw)
-                        if (parsed != null && parsed.isNotEmpty()) return parsed
-                        if (parsed != null) return parsed
+                        id = XposedHelpers.getStaticIntField(factory, fname)
+                        Log.d("QQManagerFactory.$fname=$id")
+                        break
                     } catch (_: Throwable) {
                     }
                 }
-            return null
+            }
+        } catch (t: Throwable) {
+            Log.d("QQManagerFactory: ${t.message}")
         }
-
-        private fun coerceToFriends(raw: Any): List<FriendEntry>? {
-            val collection: Collection<*> = when (raw) {
-                is Collection<*> -> raw
-                is Array<*> -> raw.toList()
-                is Map<*, *> -> raw.values
-                else -> return null
+        val candidates = buildList {
+            if (id != null) add(id!!)
+            add(50) // classic FriendsManager id used by QA
+            add(51)
+            add(49)
+            add(52)
+        }.distinct()
+        for (mid in candidates) {
+            try {
+                val mgr = XposedHelpers.callMethod(app, "getManager", mid)
+                if (mgr != null) {
+                    val cn = mgr.javaClass.name
+                    Log.d("getManager($mid) -> $cn")
+                    if (cn.contains("Friend", ignoreCase = true) ||
+                        cn.contains("Buddy", ignoreCase = true) ||
+                        mid == 50 || mid == id
+                    ) {
+                        // verify has friends map
+                        if (findFriendsMap(mgr) != null || cn.contains("FriendsManager")) {
+                            return mgr
+                        }
+                        // still return if FriendsManager name
+                        if (cn.contains("FriendsManager")) return mgr
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.d("getManager($mid): ${t.message}")
             }
-            val out = ArrayList<FriendEntry>()
-            for (item in collection) {
-                if (item == null) continue
-                val uin = extractUin(item) ?: continue
-                if (uin.length < 5) continue
-                val name = extractName(item)
-                out.add(
-                    FriendEntry(
-                        uin = uin,
-                        name = name,
-                        source = FriendSource.API
-                    )
-                )
-            }
-            // Dedup by uin
-            return out.associateBy { it.uin }.values.toList()
         }
-
-        private fun extractUin(item: Any): String? {
-            val keys = listOf("uin", "mUin", "friendUin", "uint64_friend_uin", "uUin")
-            for (k in keys) {
-                val v = runCatching { XposedHelpers.getObjectField(item, k) }.getOrNull()
-                val n = UinUtil.normalize(v?.toString())
-                if (n != null) return n
+        // Scan managers 0..80 for FriendsManager
+        for (mid in 0..80) {
+            try {
+                val mgr = XposedHelpers.callMethod(app, "getManager", mid) ?: continue
+                if (mgr.javaClass.name.contains("FriendsManager")) {
+                    Log.i("Found FriendsManager at id=$mid")
+                    return mgr
+                }
+            } catch (_: Throwable) {
             }
-            for (m in listOf("getUin", "getFriendUin", "getUinString")) {
-                val v = runCatching { XposedHelpers.callMethod(item, m) }.getOrNull()
-                val n = UinUtil.normalize(v?.toString())
-                if (n != null) return n
-            }
-            return null
         }
-
-        private fun extractName(item: Any): String {
-            val keys = listOf("remark", "name", "mName", "nick", "nickname", "displayName")
-            for (k in keys) {
-                val v = runCatching { XposedHelpers.getObjectField(item, k) }.getOrNull()?.toString()
-                if (!v.isNullOrBlank()) return v
-            }
-            for (m in listOf("getRemark", "getName", "getNick", "getFriendNick")) {
-                val v = runCatching { XposedHelpers.callMethod(item, m) }.getOrNull()?.toString()
-                if (!v.isNullOrBlank()) return v
-            }
-            return ""
-        }
+        return null
     }
-}
 
-class DbFriendSource(
-    private val context: Context,
-    private val cl: ClassLoader?
-) : FriendListProvider {
-
-    override fun currentOwnerUin(): String? {
-        cl ?: return ApiFriendSource.resolveOwnerUin(
-            context.classLoader
+    /**
+     * QA: find ConcurrentHashMap field whose values are Friends entities.
+     */
+    private fun findFriendsMap(friendsManager: Any): ConcurrentHashMap<*, *>? {
+        val friendsClass = XposedHelpers.findClassIfExists(
+            "com.tencent.mobileqq.data.Friends",
+            cl
         )
-        return ApiFriendSource.resolveOwnerUin(cl)
-    }
-
-    override fun fetch(): Result<FriendListResult> {
-        return runCatching {
-            val owner = currentOwnerUin()
-                ?: throw IllegalStateException("Cannot resolve owner uin for DB path")
-            val friends = scanContactDatabases(owner)
-            if (friends.isEmpty()) {
-                // Empty may be valid, but if no DB found throw
-                throw IllegalStateException("No contact rows found in local DBs")
+        var clazz: Class<*>? = friendsManager.javaClass
+        while (clazz != null && clazz != Any::class.java) {
+            for (field in clazz.declaredFields) {
+                if (field.type != ConcurrentHashMap::class.java &&
+                    !ConcurrentHashMap::class.java.isAssignableFrom(field.type)
+                ) {
+                    // also HashMap
+                    if (!MutableMap::class.java.isAssignableFrom(field.type)) continue
+                }
+                try {
+                    field.isAccessible = true
+                    val map = field.get(friendsManager) as? Map<*, *> ?: continue
+                    if (map.isEmpty()) continue
+                    val sample = map.values.firstOrNull() ?: continue
+                    if (friendsClass != null && friendsClass.isInstance(sample)) {
+                        @Suppress("UNCHECKED_CAST")
+                        return map as ConcurrentHashMap<*, *>
+                    }
+                    // Heuristic: has uin field
+                    if (extractFriendUin(sample) != null) {
+                        @Suppress("UNCHECKED_CAST")
+                        return if (map is ConcurrentHashMap<*, *>) map
+                        else ConcurrentHashMap(map)
+                    }
+                } catch (_: Throwable) {
+                }
             }
-            FriendListResult(
-                ownerUin = owner,
-                friends = friends,
-                fetchedAt = System.currentTimeMillis(),
-                source = FriendSource.DB
-            )
+            clazz = clazz.superclass
         }
+        return null
     }
 
-    private fun scanContactDatabases(owner: String): List<FriendEntry> {
-        val dirs = listOf(
-            context.getDatabasePath("noop").parentFile,
-            File(context.filesDir.parentFile, "databases"),
-            context.filesDir,
-            context.filesDir.parentFile
-        ).filterNotNull().distinct()
-
+    private fun loadFromFriendsManager(): List<FriendEntry>? {
+        val mgr = getFriendsManager() ?: return null
+        val map = findFriendsMap(mgr) ?: return emptyList()
         val out = LinkedHashMap<String, FriendEntry>()
-        val nameHints = listOf("friend", "buddy", "contact", "troop", "slowtable", "nt_msg")
-        for (dir in dirs) {
-            if (!dir.exists() || !dir.isDirectory) continue
-            dir.listFiles()
-                ?.filter { it.isFile && it.name.endsWith(".db") }
-                ?.filter { f ->
-                    val n = f.name.lowercase()
-                    nameHints.any { n.contains(it) } || n.contains(owner) || n.startsWith("qq")
-                }
-                ?.forEach { file ->
-                    tryReadFriends(file, out)
-                }
+        for (value in map.values) {
+            if (value == null) continue
+            val uin = extractFriendUin(value) ?: continue
+            if (uin == resolveOwnerUin()) continue
+            val remark = getFieldString(value, "remark")
+            val nick = getFieldString(value, "name")
+                ?: getFieldString(value, "nick")
+            val display = when {
+                !remark.isNullOrBlank() -> remark
+                !nick.isNullOrBlank() -> nick
+                else -> uin
+            }
+            out[uin] = FriendEntry(
+                uin = uin,
+                name = display,
+                nick = nick,
+                source = FriendSource.API
+            )
         }
         return out.values.toList()
     }
 
-    private fun tryReadFriends(file: File, out: MutableMap<String, FriendEntry>) {
-        var db: android.database.sqlite.SQLiteDatabase? = null
-        try {
-            db = android.database.sqlite.SQLiteDatabase.openDatabase(
-                file.absolutePath,
-                null,
-                android.database.sqlite.SQLiteDatabase.OPEN_READONLY
-            )
-            val tables = mutableListOf<String>()
-            db.rawQuery(
-                "SELECT name FROM sqlite_master WHERE type='table'",
-                null
-            ).use { c ->
-                while (c.moveToNext()) tables.add(c.getString(0))
+    private fun extractFriendUin(friendsObj: Any): String? {
+        // QA: Friends.uin is String (sometimes long stored as string)
+        for (name in listOf("uin", "mUin", "friendUin")) {
+            try {
+                val f = findField(friendsObj.javaClass, name) ?: continue
+                f.isAccessible = true
+                val v = f.get(friendsObj) ?: continue
+                val n = UinUtil.normalize(v.toString())
+                if (n != null) return n
+            } catch (_: Throwable) {
             }
-            for (table in tables) {
-                val tl = table.lowercase()
-                if (tl.contains("android_") || tl.startsWith("sqlite_")) continue
-                if (!tl.contains("friend") && !tl.contains("buddy")) continue
-                readTable(db, table, out)
-            }
-        } catch (t: Throwable) {
-            Log.d("DB ${file.name}: ${t.message}")
-        } finally {
-            runCatching { db?.close() }
+        }
+        return null
+    }
+
+    private fun getFieldString(obj: Any, name: String): String? {
+        return try {
+            val f = findField(obj.javaClass, name) ?: return null
+            f.isAccessible = true
+            f.get(obj)?.toString()
+        } catch (_: Throwable) {
+            null
         }
     }
 
-    private fun readTable(
-        db: android.database.sqlite.SQLiteDatabase,
-        table: String,
-        out: MutableMap<String, FriendEntry>
-    ) {
-        try {
-            db.rawQuery("SELECT * FROM `$table` LIMIT 1", null).use { probe ->
-                if (probe.columnCount == 0) return
+    private fun findField(clazz: Class<*>, name: String): Field? {
+        var c: Class<*>? = clazz
+        while (c != null) {
+            try {
+                return c.getDeclaredField(name)
+            } catch (_: NoSuchFieldException) {
+                c = c.superclass
             }
-            db.rawQuery("SELECT * FROM `$table` LIMIT 5000", null).use { c ->
-                val colNames = (0 until c.columnCount).map { c.getColumnName(it) }
-                val uinCol = colNames.firstOrNull { n ->
-                    val l = n.lowercase()
-                    l == "uin" || l == "frienduin" || l.endsWith("uin") && !l.contains("troop")
-                } ?: return
-                val nameCol = colNames.firstOrNull { n ->
-                    val l = n.lowercase()
-                    l.contains("remark") || l == "name" || l.contains("nick")
-                }
-                val uinIdx = c.getColumnIndex(uinCol)
-                val nameIdx = nameCol?.let { c.getColumnIndex(it) } ?: -1
-                while (c.moveToNext()) {
-                    val uin = UinUtil.normalize(c.getString(uinIdx)) ?: continue
-                    if (uin.length < 5) continue
-                    val name = if (nameIdx >= 0) c.getString(nameIdx) ?: "" else ""
-                    if (!out.containsKey(uin)) {
-                        out[uin] = FriendEntry(
-                            uin = uin,
-                            name = name,
-                            source = FriendSource.DB
-                        )
+        }
+        return null
+    }
+
+    private fun requestFriendListRefresh() {
+        try {
+            val handler = getFriendListHandler() ?: return
+            // QA: Reflex.invokeVirtualAny(handler, true, true, boolean, boolean, void)
+            for (m in handler.javaClass.methods) {
+                if (m.parameterTypes.size == 2 &&
+                    m.parameterTypes[0] == Boolean::class.javaPrimitiveType &&
+                    m.parameterTypes[1] == Boolean::class.javaPrimitiveType &&
+                    (m.returnType == Void.TYPE || m.returnType == Void::class.java)
+                ) {
+                    try {
+                        m.isAccessible = true
+                        m.invoke(handler, true, true)
+                        Log.i("FriendListHandler refresh via ${m.name}")
+                        return
+                    } catch (_: Throwable) {
                     }
                 }
             }
+            // name guess
+            for (name in listOf("getFriendGroupList", "getFriendList", "a", "b")) {
+                try {
+                    XposedHelpers.callMethod(handler, name, true, true)
+                    Log.i("FriendListHandler.$name(true,true)")
+                    return
+                } catch (_: Throwable) {
+                }
+            }
         } catch (t: Throwable) {
-            Log.d("table $table: ${t.message}")
+            Log.d("requestFriendListRefresh: ${t.message}")
         }
+    }
+
+    private fun getFriendListHandler(): Any? {
+        val app = getQQAppInterface() ?: return null
+        try {
+            // QQ 8.5+: getBusinessHandler(String className)
+            val flhName = "com.tencent.mobileqq.app.FriendListHandler"
+            return XposedHelpers.callMethod(app, "getBusinessHandler", flhName)
+        } catch (_: Throwable) {
+        }
+        try {
+            return XposedHelpers.callMethod(app, "getBusinessHandler", 1)
+        } catch (_: Throwable) {
+        }
+        // scan methods named getBusinessHandler
+        for (m in app.javaClass.methods) {
+            if (m.name != "getBusinessHandler") continue
+            try {
+                m.isAccessible = true
+                if (m.parameterTypes.size == 1 && m.parameterTypes[0] == String::class.java) {
+                    return m.invoke(app, "com.tencent.mobileqq.app.FriendListHandler")
+                }
+                if (m.parameterTypes.size == 1 && m.parameterTypes[0] == Int::class.javaPrimitiveType) {
+                    return m.invoke(app, 1)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
+    private fun loadFromFriendDataService(): List<FriendEntry>? {
+        val app = getQQAppInterface() ?: return null
+        val serviceNames = listOf(
+            "com.tencent.mobileqq.friend.api.IFriendDataService",
+            "com.tencent.mobileqq.profilecard.api.IProfileDataService"
+        )
+        for (sn in serviceNames) {
+            try {
+                val iface = XposedHelpers.findClassIfExists(sn, cl) ?: continue
+                val svc = XposedHelpers.callMethod(app, "getRuntimeService", iface, "all")
+                    ?: continue
+                val list = invokeAnyFriendList(svc) ?: continue
+                if (list.isNotEmpty()) return list
+            } catch (t: Throwable) {
+                Log.d("service $sn: ${t.message}")
+            }
+        }
+        return null
+    }
+
+    private fun invokeAnyFriendList(manager: Any): List<FriendEntry>? {
+        val prefer = listOf(
+            "getAllFriends", "getFriendList", "getAllFriendList",
+            "getFriends", "getAllBuddyList", "getFriendListSnapshot"
+        )
+        for (name in prefer) {
+            try {
+                val raw = XposedHelpers.callMethod(manager, name) ?: continue
+                coerceToFriends(raw)?.let { return it }
+            } catch (_: Throwable) {
+            }
+        }
+        for (m in manager.javaClass.methods) {
+            if (m.parameterTypes.isNotEmpty()) continue
+            if (Modifier.isStatic(m.modifiers)) continue
+            val rt = m.returnType
+            if (!List::class.java.isAssignableFrom(rt) &&
+                !Map::class.java.isAssignableFrom(rt) &&
+                !rt.name.contains("List")
+            ) continue
+            try {
+                m.isAccessible = true
+                val raw = m.invoke(manager) ?: continue
+                coerceToFriends(raw)?.let { if (it.isNotEmpty()) return it }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
+    private fun coerceToFriends(raw: Any): List<FriendEntry>? {
+        val collection: Collection<*> = when (raw) {
+            is Collection<*> -> raw
+            is Array<*> -> raw.toList()
+            is Map<*, *> -> raw.values
+            else -> return null
+        }
+        val out = LinkedHashMap<String, FriendEntry>()
+        for (item in collection) {
+            if (item == null) continue
+            val uin = extractFriendUin(item) ?: continue
+            val remark = getFieldString(item, "remark")
+            val nick = getFieldString(item, "name") ?: getFieldString(item, "nick")
+            val display = when {
+                !remark.isNullOrBlank() -> remark
+                !nick.isNullOrBlank() -> nick
+                else -> uin
+            }
+            out[uin] = FriendEntry(uin, display, nick, FriendSource.API)
+        }
+        return out.values.toList()
     }
 }

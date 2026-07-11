@@ -6,6 +6,7 @@ import com.fuckqq.nullfriend.data.DetectorRepository
 import com.fuckqq.nullfriend.data.Prefs
 import com.fuckqq.nullfriend.hook.SettingsInjectHook
 import com.fuckqq.nullfriend.hook.StartupHook
+import com.fuckqq.nullfriend.provider.FriendListRespCache
 import com.fuckqq.nullfriend.provider.HybridFriendListProvider
 import com.fuckqq.nullfriend.service.DetectionService
 import com.fuckqq.nullfriend.service.Notifier
@@ -42,6 +43,7 @@ object ModuleMain {
         Log.i("Loading in ${lpparam.packageName} process=${lpparam.processName}")
 
         if (hooksInstalled.compareAndSet(false, true)) {
+            FriendListRespCache.install(lpparam)
             hookApplicationCreate(lpparam)
             SettingsInjectHook.install(lpparam)
             StartupHook.install(lpparam)
