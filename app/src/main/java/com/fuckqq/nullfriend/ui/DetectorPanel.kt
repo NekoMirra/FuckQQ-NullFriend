@@ -7,21 +7,25 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.graphics.drawable.StateListDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.content.res.ColorStateList
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.BaseAdapter
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
-import android.widget.ListView
+import android.widget.ScrollView
 import android.widget.Spinner
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.fuckqq.nullfriend.BuildConfig
@@ -36,27 +40,28 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * In-process polished panel UI (no module resources required).
+ * Modern in-process panel. Uses ScrollView + LinearLayout cards (NOT ListView)
+ * so action buttons receive clicks reliably.
  */
 object DetectorPanel {
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val timeFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA)
-    private val intervalLabels = listOf("关闭", "30 分钟", "1 小时", "3 小时")
+    private val timeFmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
+    private val timeFmtFull = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA)
+    private val intervalLabels = listOf("定时：关", "定时：30分", "定时：1小时", "定时：3小时")
     private val intervalValues = listOf(0, 30, 60, 180)
 
-    // Palette
-    private const val C_BG = 0xFFF5F6F8.toInt()
-    private const val C_CARD = 0xFFFFFFFF.toInt()
-    private const val C_PRIMARY = 0xFFFF5722.toInt()
-    private const val C_PRIMARY_DARK = 0xFFE64A19.toInt()
-    private const val C_TEXT = 0xFF1A1A1A.toInt()
-    private const val C_SUB = 0xFF8A8F98.toInt()
-    private const val C_LINE = 0xFFEEF0F3.toInt()
-    private const val C_CHIP_BG = 0xFFFFF3EE.toInt()
-    private const val C_OK = 0xFF2E7D32.toInt()
-    private const val C_WARN = 0xFFC62828.toInt()
-    private const val C_BTN_SECONDARY = 0xFFF0F1F3.toInt()
+    // Modern dark-orange theme (readable on QQ light UIs)
+    private const val BG = 0xFF0F1115.toInt()
+    private const val SURFACE = 0xFF1A1D24.toInt()
+    private const val SURFACE2 = 0xFF242833.toInt()
+    private const val ACCENT = 0xFFFF6B35.toInt()
+    private const val ACCENT_SOFT = 0x33FF6B35
+    private const val TEXT = 0xFFF2F3F5.toInt()
+    private const val TEXT2 = 0xFF9AA0A6.toInt()
+    private const val OK = 0xFF3DDC97.toInt()
+    private const val DANGER = 0xFFFF5C7A.toInt()
+    private const val DIVIDER = 0xFF2C313C.toInt()
 
     @Volatile
     private var openDialog: Dialog? = null
@@ -68,257 +73,308 @@ object DetectorPanel {
                     ModuleMain.ensureInit(activity.applicationContext)
                 }
                 if (!ModuleMain.isReady()) {
-                    Toast.makeText(activity, "模块服务未就绪，请完全重启 QQ 后再试", Toast.LENGTH_LONG).show()
+                    toast(activity, "模块未就绪，请强停 QQ 后重开")
                     return@post
                 }
                 openDialog?.dismiss()
-                val dialog = Dialog(activity)
+
+                val dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_Dialog_NoActionBar)
                 dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-                dialog.setContentView(buildContent(activity) { dialog.dismiss() })
+                val root = buildRoot(activity) { dialog.dismiss() }
+                dialog.setContentView(root)
+                dialog.setCancelable(true)
                 dialog.setOnDismissListener { openDialog = null }
-                dialog.window?.setBackgroundDrawable(roundRect(C_BG, 20f, activity))
-                dialog.window?.setLayout(
-                    (activity.resources.displayMetrics.widthPixels * 0.94f).toInt(),
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
+
+                dialog.window?.apply {
+                    setBackgroundDrawable(shape(BG, 22f, activity))
+                    val w = (activity.resources.displayMetrics.widthPixels * 0.94f).toInt()
+                    val h = (activity.resources.displayMetrics.heightPixels * 0.86f).toInt()
+                    setLayout(w, h)
+                    // Dim behind
+                    setDimAmount(0.55f)
+                }
                 openDialog = dialog
                 dialog.show()
             } catch (t: Throwable) {
                 Log.e("DetectorPanel.show failed", t)
-                Toast.makeText(activity, "打开面板失败: ${t.message}", Toast.LENGTH_LONG).show()
+                toast(activity, "打开失败: ${t.message}")
             }
         }
+    }
+
+    private fun toast(ctx: Context, msg: String) {
+        Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
     }
 
     private fun dp(ctx: Context, v: Float): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, ctx.resources.displayMetrics).toInt()
 
-    private fun roundRect(color: Int, radiusDp: Float, ctx: Context): GradientDrawable =
+    private fun shape(color: Int, radiusDp: Float, ctx: Context, stroke: Int? = null): GradientDrawable =
         GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(ctx, radiusDp).toFloat()
+            if (stroke != null) setStroke(dp(ctx, 1f), stroke)
         }
 
-    private fun pillButton(
-        ctx: Context,
-        text: String,
-        bg: Int,
-        fg: Int,
-        bold: Boolean = false
-    ): TextView {
-        return TextView(ctx).apply {
-            this.text = text
-            setTextColor(fg)
-            textSize = 13f
-            if (bold) typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setPadding(dp(ctx, 12f), dp(ctx, 10f), dp(ctx, 12f), dp(ctx, 10f))
-            background = roundRect(bg, 12f, ctx)
-            isClickable = true
-            isFocusable = true
+    private fun ripple(normal: Int, radiusDp: Float, ctx: Context): android.graphics.drawable.Drawable {
+        val content = shape(normal, radiusDp, ctx)
+        return if (Build.VERSION.SDK_INT >= 21) {
+            val mask = shape(Color.WHITE, radiusDp, ctx)
+            RippleDrawable(
+                ColorStateList.valueOf(0x44FFFFFF),
+                content,
+                mask
+            )
+        } else {
+            StateListDrawable().apply {
+                val pressed = shape(
+                    Color.argb(
+                        255,
+                        (Color.red(normal) * 0.85f).toInt(),
+                        (Color.green(normal) * 0.85f).toInt(),
+                        (Color.blue(normal) * 0.85f).toInt()
+                    ),
+                    radiusDp,
+                    ctx
+                )
+                addState(intArrayOf(android.R.attr.state_pressed), pressed)
+                addState(intArrayOf(), content)
+            }
         }
     }
 
-    private fun sectionLabel(ctx: Context, text: String): TextView =
-        TextView(ctx).apply {
-            this.text = text
-            setTextColor(C_SUB)
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(ctx, 2f), dp(ctx, 12f), 0, dp(ctx, 6f))
+    private fun btn(
+        ctx: Context,
+        label: String,
+        filled: Boolean,
+        accent: Boolean = false,
+        onClick: () -> Unit
+    ): TextView {
+        val bg = when {
+            filled && accent -> ACCENT
+            filled -> SURFACE2
+            else -> Color.TRANSPARENT
         }
+        val fg = when {
+            filled && accent -> Color.WHITE
+            filled -> TEXT
+            else -> ACCENT
+        }
+        return TextView(ctx).apply {
+            text = label
+            setTextColor(fg)
+            textSize = 14f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            gravity = Gravity.CENTER
+            minHeight = dp(ctx, 44f)
+            setPadding(dp(ctx, 14f), dp(ctx, 12f), dp(ctx, 14f), dp(ctx, 12f))
+            background = if (filled) {
+                ripple(bg, 14f, ctx)
+            } else {
+                ripple(ACCENT_SOFT, 14f, ctx).also {
+                    // keep soft fill
+                }
+                shape(ACCENT_SOFT, 14f, ctx)
+            }
+            if (!filled) {
+                background = shape(ACCENT_SOFT, 14f, ctx)
+            }
+            isClickable = true
+            isFocusable = true
+            // Ensure we consume clicks even if parent wants them
+            setOnTouchListener { v, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.alpha = 0.75f
+                        false
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        v.alpha = 1f
+                        false
+                    }
+                    else -> false
+                }
+            }
+            setOnClickListener {
+                try {
+                    onClick()
+                } catch (t: Throwable) {
+                    Log.e("btn click", t)
+                    toast(ctx, t.message ?: "操作失败")
+                }
+            }
+        }
+    }
 
-    private fun buildContent(activity: Activity, onClose: () -> Unit): View {
+    private fun buildRoot(activity: Activity, onClose: () -> Unit): View {
         val prefs = ModuleMain.prefs
         val repo = ModuleMain.repository
         val service = ModuleMain.detectionService
-        val pad = dp(activity, 14f)
+        val p = dp(activity, 16f)
 
-        val outer = LinearLayout(activity).apply {
+        val root = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(C_BG)
-            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(BG)
+            setPadding(p, p, p, p)
         }
 
-        // Header
+        // ===== Header =====
         val header = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = roundRect(C_PRIMARY, 16f, activity)
-            setPadding(dp(activity, 16f), dp(activity, 14f), dp(activity, 12f), dp(activity, 14f))
+            setPadding(0, 0, 0, dp(activity, 12f))
         }
-        val headerText = LinearLayout(activity).apply {
+        val titleCol = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        headerText.addView(TextView(activity).apply {
+        titleCol.addView(TextView(activity).apply {
             text = "去TM的单向好友"
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(TEXT)
+            textSize = 20f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
         })
-        headerText.addView(TextView(activity).apply {
-            text = "v${BuildConfig.VERSION_NAME} · 仅 ${Constants.QQ_PACKAGE}"
-            setTextColor(0xCCFFFFFF.toInt())
-            textSize = 11f
-            setPadding(0, dp(activity, 2f), 0, 0)
-        })
-        header.addView(headerText)
-        val closeBtn = TextView(activity).apply {
-            text = "✕"
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            gravity = Gravity.CENTER
-            setPadding(dp(activity, 10f), dp(activity, 4f), dp(activity, 10f), dp(activity, 4f))
-            setOnClickListener { onClose() }
-        }
-        header.addView(closeBtn)
-        outer.addView(
-            header,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(activity, 12f) }
-        )
-
-        // Status card
-        val statusCard = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            background = roundRect(C_CARD, 14f, activity)
-            setPadding(dp(activity, 14f), dp(activity, 12f), dp(activity, 14f), dp(activity, 12f))
-            elevation = dp(activity, 1f).toFloat()
-        }
-        val statusTitle = TextView(activity).apply {
-            text = "检测状态"
-            setTextColor(C_TEXT)
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        val statusBody = TextView(activity).apply {
-            setTextColor(C_SUB)
-            textSize = 12.5f
-            setLineSpacing(dp(activity, 2f).toFloat(), 1f)
-            setPadding(0, dp(activity, 6f), 0, 0)
-        }
-        val countChip = TextView(activity).apply {
-            setTextColor(C_PRIMARY_DARK)
+        titleCol.addView(TextView(activity).apply {
+            text = "检测列表消失 · v${BuildConfig.VERSION_NAME}"
+            setTextColor(TEXT2)
             textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            background = roundRect(C_CHIP_BG, 8f, activity)
-            setPadding(dp(activity, 10f), dp(activity, 5f), dp(activity, 10f), dp(activity, 5f))
-            setPadding(dp(activity, 10f), dp(activity, 5f), dp(activity, 10f), dp(activity, 5f))
+            setPadding(0, dp(activity, 3f), 0, 0)
+        })
+        header.addView(titleCol)
+        header.addView(btn(activity, "关闭", filled = true, accent = false, onClick = onClose).apply {
+            minWidth = dp(activity, 64f)
+        })
+        root.addView(header)
+
+        // ===== Stats strip =====
+        val stats = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = shape(SURFACE, 16f, activity)
+            setPadding(dp(activity, 12f), dp(activity, 12f), dp(activity, 12f), dp(activity, 12f))
         }
-        statusCard.addView(statusTitle)
-        statusCard.addView(statusBody)
-        statusCard.addView(
-            countChip,
-            LinearLayout.LayoutParams(
+        val chipFriends = makeStatChip(activity, "好友", "—")
+        val chipDeleted = makeStatChip(activity, "被删", "0")
+        val chipSource = makeStatChip(activity, "来源", "—")
+        stats.addView(chipFriends.first, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        stats.addView(chipDeleted.first, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            leftMargin = dp(activity, 8f); rightMargin = dp(activity, 8f)
+        })
+        stats.addView(chipSource.first, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(stats, lpMatch().apply { bottomMargin = dp(activity, 10f) })
+
+        val statusLine = TextView(activity).apply {
+            setTextColor(TEXT2)
+            textSize = 12f
+            setLineSpacing(dp(activity, 2f).toFloat(), 1.1f)
+            setPadding(dp(activity, 4f), 0, dp(activity, 4f), dp(activity, 10f))
+        }
+        root.addView(statusLine)
+
+        // ===== Toolbar: account + refresh =====
+        val tool = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = shape(SURFACE, 16f, activity)
+            setPadding(dp(activity, 12f), dp(activity, 10f), dp(activity, 12f), dp(activity, 12f))
+        }
+        tool.addView(TextView(activity).apply {
+            text = "账号"
+            setTextColor(TEXT2)
+            textSize = 11f
+        })
+        val accountSpinner = Spinner(activity).apply {
+            setPopupBackgroundDrawable(shape(SURFACE2, 12f, activity))
+            setPadding(0, dp(activity, 4f), 0, dp(activity, 4f))
+        }
+        tool.addView(accountSpinner)
+
+        val actionScroll = HorizontalScrollView(activity).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(0, dp(activity, 8f), 0, 0)
+        }
+        val actions = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnRefresh = btn(activity, "立即刷新", filled = true, accent = true) {}
+        val btnNotify = btn(activity, if (prefs.notifyEnabled) "通知：开" else "通知：关", filled = true) {}
+        val intervalSpinner = Spinner(activity).apply {
+            setPopupBackgroundDrawable(shape(SURFACE2, 12f, activity))
+            adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, intervalLabels)
+            setSelection(intervalValues.indexOf(prefs.intervalMinutes).let { if (it >= 0) it else 0 })
+        }
+        // wrap spinner in a dark pill
+        val intervalWrap = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = shape(SURFACE2, 14f, activity)
+            setPadding(dp(activity, 6f), 0, dp(activity, 6f), 0)
+            gravity = Gravity.CENTER_VERTICAL
+            addView(intervalSpinner, LinearLayout.LayoutParams(dp(activity, 120f), dp(activity, 44f)))
+        }
+        val btnClear = btn(activity, "清空历史", filled = true) {}
+
+        fun addAction(v: View) {
+            actions.addView(v, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(activity, 8f) }
-        )
-        outer.addView(
-            statusCard,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(activity, 10f) }
-        )
-
-        // Account
-        outer.addView(sectionLabel(activity, "账号"))
-        val accountSpinner = Spinner(activity)
-        val accountWrap = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            background = roundRect(C_CARD, 12f, activity)
-            setPadding(dp(activity, 6f), dp(activity, 2f), dp(activity, 6f), dp(activity, 2f))
+            ).apply { rightMargin = dp(activity, 8f) })
         }
-        accountWrap.addView(accountSpinner)
-        outer.addView(accountWrap)
+        addAction(btnRefresh)
+        addAction(btnNotify)
+        addAction(intervalWrap)
+        addAction(btnClear)
+        actionScroll.addView(actions)
+        tool.addView(actionScroll)
+        root.addView(tool, lpMatch().apply { bottomMargin = dp(activity, 12f) })
 
-        // Actions
-        outer.addView(sectionLabel(activity, "操作"))
-        val actionRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        val btnRefresh = pillButton(activity, "立即刷新", C_PRIMARY, Color.WHITE, bold = true)
-        val btnClear = pillButton(activity, "清空历史", C_BTN_SECONDARY, C_TEXT)
-        actionRow.addView(
-            btnRefresh,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                rightMargin = dp(activity, 8f)
-            }
-        )
-        actionRow.addView(
-            btnClear,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        outer.addView(actionRow)
-
-        // Settings row
-        outer.addView(sectionLabel(activity, "设置"))
-        val settingsCard = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            background = roundRect(C_CARD, 12f, activity)
-            setPadding(dp(activity, 12f), dp(activity, 8f), dp(activity, 12f), dp(activity, 10f))
+        // ===== History header =====
+        val histHeader = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(activity, 4f), 0, dp(activity, 4f), dp(activity, 8f))
         }
-        val swNotify = Switch(activity).apply {
-            text = "  系统通知（默认关）"
-            setTextColor(C_TEXT)
-            textSize = 13f
-            isChecked = prefs.notifyEnabled
-            setOnCheckedChangeListener { _, c -> prefs.notifyEnabled = c }
-        }
-        settingsCard.addView(swNotify)
-        settingsCard.addView(TextView(activity).apply {
-            text = "定时检测"
-            setTextColor(C_SUB)
-            textSize = 12f
-            setPadding(0, dp(activity, 8f), 0, 0)
+        histHeader.addView(TextView(activity).apply {
+            text = "被删记录"
+            setTextColor(TEXT)
+            textSize = 15f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
-        val intervalSpinner = Spinner(activity)
-        intervalSpinner.adapter =
-            ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, intervalLabels)
-        val iIdx = intervalValues.indexOf(prefs.intervalMinutes).let { if (it >= 0) it else 0 }
-        intervalSpinner.setSelection(iIdx)
-        intervalSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                prefs.intervalMinutes = intervalValues[position]
-                service.reschedulePeriodic()
+        val histCount = TextView(activity).apply {
+            setTextColor(TEXT2)
+            textSize = 12f
+        }
+        histHeader.addView(histCount)
+        root.addView(histHeader)
+
+        // ===== Scrollable history cards (buttons work) =====
+        val historyHost = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val historyScroll = object : ScrollView(activity) {
+            // allow nested vertical scroll inside dialog
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                // default is fine for simple cards
+                return super.onInterceptTouchEvent(ev)
             }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
-        settingsCard.addView(intervalSpinner)
-        outer.addView(settingsCard)
-
-        // History
-        outer.addView(sectionLabel(activity, "被删记录"))
-        val tip = TextView(activity).apply {
-            text = "无法区分对方删你或你删对方。每条可打开资料卡 / 本地聊天。"
-            setTextColor(C_SUB)
-            textSize = 11.5f
-            setPadding(dp(activity, 2f), 0, 0, dp(activity, 6f))
-        }
-        outer.addView(tip)
-
-        val historyList = ListView(activity).apply {
-            divider = null
-            dividerHeight = dp(activity, 8f)
-            setSelector(android.R.color.transparent)
-            clipToPadding = false
-        }
-        outer.addView(
-            historyList,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(activity, 280f)
+        }.apply {
+            isFillViewport = true
+            setBackgroundColor(Color.TRANSPARENT)
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(
+                historyHost,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
             )
+        }
+        root.addView(
+            historyScroll,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         )
 
         var accounts = repo.listAccounts().map { it.ownerUin }.distinct().toMutableList()
         var selected = prefs.uiSelectedOwnerUin ?: accounts.firstOrNull()
-        var history = emptyList<DeletionRecord>()
 
         fun labels(): List<String> =
-            if (accounts.isEmpty()) listOf("（暂无账号，请先刷新）") else accounts
+            if (accounts.isEmpty()) listOf("暂无账号 · 先点刷新") else accounts
 
         fun bindAccounts() {
             accountSpinner.adapter =
@@ -330,51 +386,82 @@ object DetectorPanel {
             }
         }
 
-        fun refreshStatusAndList() {
+        fun setStat(chip: Pair<LinearLayout, TextView>, value: String, color: Int = TEXT) {
+            chip.second.text = value
+            chip.second.setTextColor(color)
+        }
+
+        fun renderHistory(list: List<DeletionRecord>) {
+            historyHost.removeAllViews()
+            histCount.text = "${list.size} 条"
+            if (list.isEmpty()) {
+                historyHost.addView(emptyState(activity))
+                return
+            }
+            list.forEachIndexed { index, rec ->
+                historyHost.addView(
+                    historyCard(activity, rec) { action ->
+                        repo.markRead(rec.id)
+                        when (action) {
+                            "profile" -> ChatLauncher.openProfile(
+                                activity, rec.friendUin, ModuleMain.classLoader
+                            )
+                            "chat" -> ChatLauncher.openChat(
+                                activity, rec.friendUin, ModuleMain.classLoader
+                            )
+                        }
+                        // soft refresh unread dots only
+                        val owner = selected
+                        if (owner != null) {
+                            renderHistory(repo.listHistory(owner))
+                        }
+                    },
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        if (index > 0) topMargin = dp(activity, 10f)
+                    }
+                )
+            }
+        }
+
+        fun refreshAll() {
             accounts = repo.listAccounts().map { it.ownerUin }.distinct().toMutableList()
             if (selected == null) selected = accounts.firstOrNull()
             bindAccounts()
             val owner = selected
             if (owner.isNullOrBlank()) {
-                statusBody.text = "尚无基线。登录 QQ 后点「立即刷新」。"
-                countChip.text = "好友数 —"
-                history = emptyList()
-                historyList.adapter = HistoryAdapter(activity, emptyList())
+                statusLine.text = "登录 QQ 后点「立即刷新」建立基线（首次不会报删）。"
+                setStat(chipFriends, "—")
+                setStat(chipDeleted, "0")
+                setStat(chipSource, "—")
+                renderHistory(emptyList())
                 return
             }
             val acc = repo.getAccount(owner)
             val snap = repo.getSnapshot(owner)
-            val friendCount = snap?.friends?.size
-            statusBody.text = buildString {
-                append("账号 $owner\n")
-                append(
-                    if (acc?.baselineAt != null)
-                        "基线 ${timeFmt.format(Date(acc.baselineAt))}"
-                    else "基线 未建立"
-                )
+            val fc = snap?.friends?.size
+            val hist = repo.listHistory(owner)
+            setStat(chipFriends, fc?.toString() ?: "—", if ((fc ?: 0) > 10) OK else ACCENT)
+            setStat(chipDeleted, hist.size.toString(), if (hist.isNotEmpty()) DANGER else TEXT2)
+            setStat(chipSource, acc?.lastSource?.name ?: "—")
+            statusLine.text = buildString {
+                append(owner)
+                if (acc?.baselineAt != null) {
+                    append("  ·  基线 ")
+                    append(timeFmtFull.format(Date(acc.baselineAt)))
+                } else append("  ·  未建基线")
                 if (acc?.lastCheckAt != null) {
-                    append("  ·  上次 ${timeFmt.format(Date(acc.lastCheckAt))}")
+                    append("\n上次检测 ")
+                    append(timeFmtFull.format(Date(acc.lastCheckAt)))
                 }
-                append("\n来源 ${acc?.lastSource ?: "—"}")
                 if (!acc?.lastError.isNullOrBlank()) {
                     append("\n")
-                    append("错误 ${acc?.lastError}")
+                    append(acc?.lastError)
                 }
             }
-            countChip.text = if (friendCount != null) "好友数 $friendCount" else "好友数 —"
-            countChip.setTextColor(if ((friendCount ?: 0) > 0) C_OK else C_PRIMARY_DARK)
-
-            history = repo.listHistory(owner)
-            historyList.adapter = HistoryAdapter(activity, history) { rec, action ->
-                repo.markRead(rec.id)
-                when (action) {
-                    HistoryAction.PROFILE ->
-                        ChatLauncher.openProfile(activity, rec.friendUin, ModuleMain.classLoader)
-                    HistoryAction.CHAT ->
-                        ChatLauncher.openChat(activity, rec.friendUin, ModuleMain.classLoader)
-                }
-                refreshStatusAndList()
-            }
+            renderHistory(hist)
         }
 
         accountSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -382,210 +469,219 @@ object DetectorPanel {
                 if (accounts.isEmpty()) return
                 selected = accounts[position]
                 prefs.uiSelectedOwnerUin = selected
-                refreshStatusAndList()
+                refreshAll()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
+        // Wire buttons with real handlers (created empty above)
         btnRefresh.setOnClickListener {
-            statusBody.text = "检测中（合并全量好友，可能需数秒）…"
-            countChip.text = "刷新中…"
+            statusLine.text = "正在合并全量好友，请稍候…"
+            setStat(chipFriends, "…", ACCENT)
             service.refreshAsync { outcome ->
                 mainHandler.post {
                     val msg = when (outcome) {
                         is DetectionOutcome.BaselineCreated ->
-                            "已建立基线：${outcome.count} 人（${outcome.source}）"
+                            "基线已建立：${outcome.count} 人"
                         is DetectionOutcome.Checked ->
-                            "完成：${outcome.previousCount}→${outcome.currentCount}，消失 ${outcome.removed.size}"
+                            "完成 ${outcome.previousCount}→${outcome.currentCount}，消失 ${outcome.removed.size}"
                         is DetectionOutcome.Failed -> "失败：${outcome.reason}"
                         is DetectionOutcome.Skipped -> "跳过：${outcome.reason}"
                     }
-                    Toast.makeText(activity, msg, Toast.LENGTH_LONG).show()
+                    toast(activity, msg)
                     accounts = repo.listAccounts().map { it.ownerUin }.distinct().toMutableList()
                     if (selected == null) selected = accounts.firstOrNull()
-                    refreshStatusAndList()
+                    refreshAll()
                 }
             }
         }
-
+        btnNotify.setOnClickListener {
+            prefs.notifyEnabled = !prefs.notifyEnabled
+            btnNotify.text = if (prefs.notifyEnabled) "通知：开" else "通知：关"
+            toast(activity, if (prefs.notifyEnabled) "已开启系统通知" else "已关闭系统通知")
+        }
+        intervalSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                prefs.intervalMinutes = intervalValues[position]
+                service.reschedulePeriodic()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
         btnClear.setOnClickListener {
             val owner = selected ?: return@setOnClickListener
             AlertDialog.Builder(activity)
                 .setTitle("清空历史")
-                .setMessage("清空账号 $owner 的被删记录？\n基线快照会保留。")
+                .setMessage("清空 $owner 的被删记录？基线保留。")
                 .setPositiveButton("清空") { _, _ ->
                     repo.clearHistory(owner)
-                    refreshStatusAndList()
+                    refreshAll()
                 }
                 .setNegativeButton("取消", null)
                 .show()
         }
 
-        // Do not wrap in ScrollView here — attaching outer to ScrollView then
-        // returning outer causes "The specified child already has a parent".
-        refreshStatusAndList()
-        return outer
+        // Sync notify label
+        btnNotify.text = if (prefs.notifyEnabled) "通知：开" else "通知：关"
+
+        refreshAll()
+        return root
     }
 
-    private enum class HistoryAction { PROFILE, CHAT }
-
-    private class HistoryAdapter(
-        private val ctx: Context,
-        private val items: List<DeletionRecord>,
-        private val onAction: ((DeletionRecord, HistoryAction) -> Unit)? = null
-    ) : BaseAdapter() {
-
-        override fun getCount(): Int = if (items.isEmpty()) 1 else items.size
-        override fun getItem(position: Int): Any =
-            if (items.isEmpty()) Unit else items[position]
-        override fun getItemId(position: Int): Long =
-            if (items.isEmpty()) -1L else items[position].id
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            if (items.isEmpty()) {
-                return TextView(ctx).apply {
-                    text = "暂无被删记录\n建立基线后，列表减少的人会出现在这里"
-                    setTextColor(C_SUB)
-                    textSize = 13f
-                    gravity = Gravity.CENTER
-                    setPadding(dp(ctx, 16f), dp(ctx, 28f), dp(ctx, 16f), dp(ctx, 28f))
-                    background = roundRect(C_CARD, 14f, ctx)
-                }
-            }
-            val rec = items[position]
-            val card = LinearLayout(ctx).apply {
-                orientation = LinearLayout.VERTICAL
-                background = roundRect(C_CARD, 14f, ctx)
-                setPadding(dp(ctx, 14f), dp(ctx, 12f), dp(ctx, 14f), dp(ctx, 12f))
-            }
-            val top = LinearLayout(ctx).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val avatar = TextView(ctx).apply {
-                text = rec.friendName.take(1).ifBlank { "?" }
-                setTextColor(Color.WHITE)
-                textSize = 15f
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.CENTER
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(if (rec.read) 0xFFB0B4BA.toInt() else C_PRIMARY)
-                }
-            }
-            top.addView(avatar, LinearLayout.LayoutParams(dp(ctx, 36f), dp(ctx, 36f)))
-            val info = LinearLayout(ctx).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(ctx, 10f), 0, 0, 0)
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            info.addView(TextView(ctx).apply {
-                text = buildString {
-                    if (!rec.read) append("● ")
-                    append(rec.friendName.ifBlank { rec.friendUin })
-                }
-                setTextColor(C_TEXT)
-                textSize = 15f
-                typeface = Typeface.DEFAULT_BOLD
-                maxLines = 1
-            })
-            info.addView(TextView(ctx).apply {
-                text = "${rec.friendUin}  ·  约 ${
-                    SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA)
-                        .format(Date(rec.detectedAt))
-                }"
-                setTextColor(C_SUB)
-                textSize = 11.5f
-                setPadding(0, dp(ctx, 2f), 0, 0)
-            })
-            top.addView(info)
-            card.addView(top)
-
-            val btnRow = LinearLayout(ctx).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(0, dp(ctx, 10f), 0, 0)
-            }
-            val btnProfile = pillButton(ctx, "打开资料卡", C_BTN_SECONDARY, C_TEXT)
-            val btnChat = pillButton(ctx, "打开本地聊天", C_CHIP_BG, C_PRIMARY_DARK, bold = true)
-            btnProfile.setOnClickListener {
-                onAction?.invoke(rec, HistoryAction.PROFILE)
-            }
-            btnChat.setOnClickListener {
-                onAction?.invoke(rec, HistoryAction.CHAT)
-            }
-            btnRow.addView(
-                btnProfile,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    rightMargin = dp(ctx, 8f)
-                }
-            )
-            btnRow.addView(
-                btnChat,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            card.addView(btnRow)
-            return card
-        }
-
-        private fun dp(ctx: Context, v: Float): Int =
-            TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, ctx.resources.displayMetrics)
-                .toInt()
-
-        private fun roundRect(color: Int, radiusDp: Float, ctx: Context): GradientDrawable =
-            GradientDrawable().apply {
-                setColor(color)
-                cornerRadius = dp(ctx, radiusDp).toFloat()
-            }
-
-        private fun pillButton(
-            ctx: Context,
-            text: String,
-            bg: Int,
-            fg: Int,
-            bold: Boolean = false
-        ): TextView = TextView(ctx).apply {
-            this.text = text
-            setTextColor(fg)
-            textSize = 12.5f
-            if (bold) typeface = Typeface.DEFAULT_BOLD
+    private fun makeStatChip(ctx: Context, label: String, value: String): Pair<LinearLayout, TextView> {
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(dp(ctx, 8f), dp(ctx, 9f), dp(ctx, 8f), dp(ctx, 9f))
-            background = roundRect(bg, 10f, ctx)
-            isClickable = true
-            isFocusable = true
+            background = shape(SURFACE2, 12f, ctx)
+            setPadding(dp(ctx, 8f), dp(ctx, 10f), dp(ctx, 8f), dp(ctx, 10f))
         }
+        box.addView(TextView(ctx).apply {
+            text = label
+            setTextColor(TEXT2)
+            textSize = 11f
+            gravity = Gravity.CENTER
+        })
+        val v = TextView(ctx).apply {
+            text = value
+            setTextColor(TEXT)
+            textSize = 18f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(ctx, 2f), 0, 0)
+        }
+        box.addView(v)
+        return box to v
     }
+
+    private fun emptyState(ctx: Context): View =
+        LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            background = shape(SURFACE, 16f, ctx)
+            setPadding(dp(ctx, 20f), dp(ctx, 36f), dp(ctx, 20f), dp(ctx, 36f))
+            addView(TextView(ctx).apply {
+                text = "暂无被删记录"
+                setTextColor(TEXT)
+                textSize = 16f
+                gravity = Gravity.CENTER
+                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            })
+            addView(TextView(ctx).apply {
+                text = "先「立即刷新」建基线。\n之后从列表消失的人会出现在这里。"
+                setTextColor(TEXT2)
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setPadding(0, dp(ctx, 8f), 0, 0)
+            })
+        }
+
+    private fun historyCard(
+        ctx: Context,
+        rec: DeletionRecord,
+        onAction: (String) -> Unit
+    ): View {
+        val card = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = shape(SURFACE, 16f, ctx, DIVIDER)
+            setPadding(dp(ctx, 14f), dp(ctx, 14f), dp(ctx, 14f), dp(ctx, 12f))
+        }
+
+        val top = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val avatar = TextView(ctx).apply {
+            val ch = rec.friendName.trim().firstOrNull()?.toString() ?: "#"
+            text = ch
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (rec.read) 0xFF5A6070.toInt() else ACCENT)
+            }
+        }
+        top.addView(avatar, LinearLayout.LayoutParams(dp(ctx, 42f), dp(ctx, 42f)))
+
+        val meta = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 12f), 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        meta.addView(TextView(ctx).apply {
+            text = buildString {
+                if (!rec.read) append("● ")
+                append(rec.friendName.ifBlank { rec.friendUin })
+            }
+            setTextColor(TEXT)
+            textSize = 16f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            maxLines = 1
+        })
+        meta.addView(TextView(ctx).apply {
+            text = "${rec.friendUin}  ·  ${timeFmt.format(Date(rec.detectedAt))}"
+            setTextColor(TEXT2)
+            textSize = 12f
+            setPadding(0, dp(ctx, 3f), 0, 0)
+        })
+        top.addView(meta)
+        card.addView(top)
+
+        // Action buttons — NOT inside ListView, so clicks work
+        val row = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(ctx, 12f), 0, 0)
+        }
+        val b1 = btn(ctx, "打开资料卡", filled = true, accent = false) { onAction("profile") }
+        val b2 = btn(ctx, "打开本地聊天", filled = true, accent = true) { onAction("chat") }
+        row.addView(
+            b1,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = dp(ctx, 8f)
+            }
+        )
+        row.addView(b2, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        card.addView(row)
+        return card
+    }
+
+    private fun lpMatch() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    )
 
     fun attachFab(activity: Activity) {
         mainHandler.post {
             try {
                 val decor = activity.window?.decorView as? FrameLayout ?: return@post
                 if (decor.findViewWithTag<View>(FAB_TAG) != null) return@post
-
                 val fab = TextView(activity).apply {
                     tag = FAB_TAG
                     text = "单向好友"
                     setTextColor(Color.WHITE)
-                    textSize = 13f
-                    typeface = Typeface.DEFAULT_BOLD
+                    textSize = 14f
+                    typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
                     gravity = Gravity.CENTER
-                    setPadding(dp(activity, 16f), dp(activity, 12f), dp(activity, 16f), dp(activity, 12f))
-                    background = GradientDrawable().apply {
-                        setColor(C_PRIMARY)
-                        cornerRadius = dp(activity, 22f).toFloat()
-                    }
-                    elevation = dp(activity, 8f).toFloat()
+                    minHeight = dp(activity, 48f)
+                    setPadding(dp(activity, 18f), dp(activity, 12f), dp(activity, 18f), dp(activity, 12f))
+                    background = ripple(ACCENT, 24f, activity)
+                    elevation = dp(activity, 10f).toFloat()
+                    isClickable = true
+                    isFocusable = true
                     setOnClickListener { show(activity) }
                 }
-                val lp = FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    gravity = Gravity.BOTTOM or Gravity.END
-                    rightMargin = dp(activity, 16f)
-                    bottomMargin = dp(activity, 96f)
-                }
-                decor.addView(fab, lp)
+                decor.addView(
+                    fab,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        gravity = Gravity.BOTTOM or Gravity.END
+                        rightMargin = dp(activity, 16f)
+                        bottomMargin = dp(activity, 100f)
+                    }
+                )
                 Log.i("FAB attached on ${activity.javaClass.name}")
             } catch (t: Throwable) {
                 Log.d("attachFab: ${t.message}")
