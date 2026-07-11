@@ -203,7 +203,8 @@ object DetectorPanel {
         col.addView(intervalSpinner)
 
         col.addView(TextView(activity).apply {
-            text = "列表中消失可能是对方删除、自己删除或其他变化，无法区分。\n点条目看详情；长按打开聊天。"
+            text = "若好友数为 0：先打开 QQ「联系人」滑一遍，等几秒再点立即刷新。\n" +
+                "列表中消失可能是对方删除、自己删除或其他变化，无法区分。\n点条目看详情；长按打开聊天。"
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(activity, 8), 0, dp(activity, 4))
