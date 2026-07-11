@@ -445,7 +445,12 @@ object DetectorPanel {
             val hist = repo.listHistory(owner)
             setStat(chipFriends, fc?.toString() ?: "—", if ((fc ?: 0) > 10) OK else ACCENT)
             setStat(chipDeleted, hist.size.toString(), if (hist.isNotEmpty()) DANGER else TEXT2)
-            setStat(chipSource, acc?.lastSource?.name ?: "—")
+            val tag = try {
+                com.fuckqq.nullfriend.provider.FriendRoster.lastSourceTag
+            } catch (_: Throwable) {
+                acc?.lastSource?.name ?: "—"
+            }
+            setStat(chipSource, tag)
             statusLine.text = buildString {
                 append(owner)
                 if (acc?.baselineAt != null) {
