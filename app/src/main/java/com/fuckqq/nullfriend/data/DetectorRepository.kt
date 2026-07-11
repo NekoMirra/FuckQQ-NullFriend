@@ -269,6 +269,27 @@ class DetectorRepository(context: Context) {
         dbHelper.writableDatabase.delete("deletion_history", "owner_uin=?", arrayOf(ownerUin))
     }
 
+    fun clearSnapshot(ownerUin: String) {
+        dbHelper.writableDatabase.delete("snapshots", "owner_uin=?", arrayOf(ownerUin))
+    }
+
+    /** Wipe baseline + history for an account (recover from garbage baseline). */
+    fun resetAccountData(ownerUin: String) {
+        val db = dbHelper.writableDatabase
+        db.delete("deletion_history", "owner_uin=?", arrayOf(ownerUin))
+        db.delete("snapshots", "owner_uin=?", arrayOf(ownerUin))
+        // keep account row but clear baseline markers
+        upsertAccount(
+            AccountState(
+                ownerUin = ownerUin,
+                baselineAt = null,
+                lastCheckAt = System.currentTimeMillis(),
+                lastSource = null,
+                lastError = "已重置脏数据，请重新刷新建基线"
+            )
+        )
+    }
+
     fun markRead(id: Long) {
         val values = ContentValues().apply { put("read", 1) }
         dbHelper.writableDatabase.update("deletion_history", values, "id=?", arrayOf(id.toString()))

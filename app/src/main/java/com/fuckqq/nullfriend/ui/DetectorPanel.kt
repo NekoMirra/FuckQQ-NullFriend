@@ -308,6 +308,7 @@ object DetectorPanel {
             addView(intervalSpinner, LinearLayout.LayoutParams(dp(activity, 120f), dp(activity, 44f)))
         }
         val btnClear = btn(activity, "清空历史", filled = true) {}
+        val btnReset = btn(activity, "重置脏数据", filled = true) {}
 
         fun addAction(v: View) {
             actions.addView(v, LinearLayout.LayoutParams(
@@ -319,6 +320,7 @@ object DetectorPanel {
         addAction(btnNotify)
         addAction(intervalWrap)
         addAction(btnClear)
+        addAction(btnReset)
         actionScroll.addView(actions)
         tool.addView(actionScroll)
         root.addView(tool, lpMatch().apply { bottomMargin = dp(activity, 12f) })
@@ -524,9 +526,34 @@ object DetectorPanel {
                 .setNegativeButton("取消", null)
                 .show()
         }
+        btnReset.setOnClickListener {
+            val owner = selected ?: return@setOnClickListener
+            AlertDialog.Builder(activity)
+                .setTitle("重置脏数据")
+                .setMessage(
+                    "将删除该账号的错误基线与被删记录（例如 10001 假好友）。\n" +
+                        "之后请重新点「立即刷新」建立真实基线。"
+                )
+                .setPositiveButton("重置") { _, _ ->
+                    service.resetDirtyData(owner)
+                    toast(activity, "已重置，请再点立即刷新")
+                    refreshAll()
+                }
+                .setNegativeButton("取消", null)
+                .show()
+        }
 
         // Sync notify label
         btnNotify.text = if (prefs.notifyEnabled) "通知：开" else "通知：关"
+
+        // Auto-offer reset if history is serial garbage
+        val histProbe = selected?.let { repo.listHistory(it) }.orEmpty()
+        if (histProbe.size >= 8 &&
+            com.fuckqq.nullfriend.util.UinUtil.looksLikeSerialGarbage(histProbe.map { it.friendUin })
+        ) {
+            statusLine.text =
+                "检测到错误被删记录（10001 序号垃圾数据）。请点「重置脏数据」后重新刷新。"
+        }
 
         refreshAll()
         return root

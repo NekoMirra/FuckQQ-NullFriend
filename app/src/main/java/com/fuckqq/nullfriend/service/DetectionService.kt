@@ -8,6 +8,7 @@ import com.fuckqq.nullfriend.domain.DiffEngine
 import com.fuckqq.nullfriend.domain.FriendSnapshot
 import com.fuckqq.nullfriend.provider.FriendListProvider
 import com.fuckqq.nullfriend.util.Log
+import com.fuckqq.nullfriend.util.UinUtil
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -63,6 +64,11 @@ class DetectionService(
         }
     }
 
+    fun resetDirtyData(ownerUin: String) {
+        repository.resetAccountData(ownerUin)
+        Log.i("Reset dirty data for $ownerUin")
+    }
+
     suspend fun runCheck(trigger: String): DetectionOutcome = mutex.withLock {
         if (!running.compareAndSet(false, true)) {
             return DetectionOutcome.Skipped("already running").also { lastOutcome = it }
@@ -77,8 +83,25 @@ class DetectionService(
                 return DetectionOutcome.Failed(reason).also { lastOutcome = it }
             }
             val list = result.getOrThrow()
+
+            if (UinUtil.looksLikeSerialGarbage(list.friends.map { it.uin })) {
+                val msg = "拒绝写入假好友列表(疑似序号 10001…)，已丢弃本轮结果"
+                Log.w(msg)
+                repository.setLastError(list.ownerUin, msg)
+                return DetectionOutcome.Failed(msg).also { lastOutcome = it }
+            }
+
             val now = System.currentTimeMillis()
-            val existing = repository.getSnapshot(list.ownerUin)
+            var existing = repository.getSnapshot(list.ownerUin)
+
+            if (existing != null &&
+                UinUtil.looksLikeSerialGarbage(existing.friends.map { it.uin })
+            ) {
+                Log.w("Wiping garbage baseline for ${list.ownerUin}")
+                repository.resetAccountData(list.ownerUin)
+                existing = null
+            }
+
             if (existing == null) {
                 repository.putSnapshot(
                     FriendSnapshot(
@@ -106,15 +129,18 @@ class DetectionService(
             }
 
             val diff = DiffEngine.diff(existing, list)
-            if (diff.removed.isNotEmpty()) {
+            val realRemoved = diff.removed.filter {
+                !UinUtil.isSuspiciousLowSerial(it.uin) || list.friends.size < 30
+            }
+            if (realRemoved.isNotEmpty()) {
                 repository.insertRemovals(
                     ownerUin = list.ownerUin,
-                    removed = diff.removed,
+                    removed = realRemoved,
                     detectedAt = now,
                     checkSource = list.source
                 )
                 if (prefs.notifyEnabled) {
-                    notifier.notifyRemovals(list.ownerUin, diff.removed)
+                    notifier.notifyRemovals(list.ownerUin, realRemoved)
                 }
             }
             repository.putSnapshot(
@@ -136,13 +162,13 @@ class DetectionService(
             )
             Log.i(
                 "Checked owner=${Log.maskUin(list.ownerUin)} " +
-                    "prev=${diff.previousCount} curr=${diff.currentCount} removed=${diff.removed.size}"
+                    "prev=${diff.previousCount} curr=${diff.currentCount} removed=${realRemoved.size}"
             )
             return DetectionOutcome.Checked(
                 ownerUin = list.ownerUin,
                 previousCount = diff.previousCount,
                 currentCount = diff.currentCount,
-                removed = diff.removed,
+                removed = realRemoved,
                 source = list.source
             ).also { lastOutcome = it }
         } catch (t: Throwable) {

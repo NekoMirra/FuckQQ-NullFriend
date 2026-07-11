@@ -8,25 +8,24 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import java.lang.reflect.Field
-import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Full friend roster, reimplemented after studying QAuxiliary's ExfriendManager algorithm
- * (NOT a source copy):
+ * Full friend roster after QA ExfriendManager algorithm + NT fallbacks.
  *
- * 1) Seed from FriendsManager: appRuntime.getManager(50) → ConcurrentHashMap whose values are
- *    com.tencent.mobileqq.data.Friends with public fields uin(String), remark, name.
- * 2) Live update from friendlist.GetFriendListResp.readFrom chunks until
- *    friend_count + startIndex == totoal_friend_count (QA integrity check).
- * 3) Force refresh: FriendListHandler method(boolean,boolean) with (true, true).
+ * Primary (classic, same as QA export seed):
+ * - getManager(50) / FriendsManager → ConcurrentHashMap values = Friends(uin,remark,name)
+ * - Hook friendlist.GetFriendListResp.readFrom; assemble chunks until complete
+ * - FriendListHandler(true,true) refresh
  *
- * Export/diff always reads [snapshot], which is this roster — same idea as QA export
- * using ExfriendManager.getPersons().
+ * Fallback for NT (FriendsManager often empty, GetFriendListResp may be gone):
+ * - Scan all managers for Maps of Friends-like entities
+ * - IFriendDataService / runtime services zero-arg list methods
+ * - Hook Friends entity readers
+ * - EntityManagerFactory / raw friend table via reflection if available
  */
 object FriendRoster {
 
@@ -45,176 +44,218 @@ object FriendRoster {
     var lastSourceTag: String = "none"
         private set
 
+    @Volatile
+    var lastDiag: String = ""
+        private set
+
     data class Chunk(
-        val ownerUin: Long,
         val startIndex: Int,
         val friendCount: Int,
         val totalFriendCount: Int,
-        val serverTime: Long,
         val friends: List<FriendEntry>
     )
 
     fun size(): Int = persons.size
 
-    fun snapshot(): List<FriendEntry> = persons.values.sortedBy { it.uin }
+    fun snapshot(): List<FriendEntry> =
+        persons.values.filter { !UinUtil.isSuspiciousLowSerial(it.uin) || persons.size < 20 }
+            .sortedBy { it.uin }
 
     fun clearMemory() {
         persons.clear()
         pendingChunks.clear()
+        lastCompleteTotal = -1
+        lastSourceTag = "none"
     }
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (!hooksReady.compareAndSet(false, true)) return
+        if (!hooksReady.compareAndSet(false, true)) {
+            hostCl = lpparam.classLoader
+            return
+        }
         hostCl = lpparam.classLoader
         hookGetFriendListResp(lpparam.classLoader)
+        hookFriendsEntity(lpparam.classLoader)
         Log.i("FriendRoster hooks installed")
     }
 
-    /**
-     * Synchronously build best roster: seed manager → request FL → wait for complete chunks.
-     */
-    fun fetchBlocking(timeoutMs: Long = 12_000L): List<FriendEntry> {
-        val cl = hostCl ?: throw IllegalStateException("FriendRoster not installed (no ClassLoader)")
+    fun fetchBlocking(timeoutMs: Long = 15_000L): List<FriendEntry> {
+        val cl = hostCl ?: throw IllegalStateException("FriendRoster not installed")
         val owner = resolveOwnerUin(cl)
             ?: throw IllegalStateException("Cannot resolve account uin")
 
-        // 1) Seed from FriendsManager map (QA init-from-internal)
-        val seeded = seedFromFriendsManager(cl)
-        if (seeded > 0) {
-            lastSourceTag = "FriendsManager"
-            Log.i("FriendRoster seed FriendsManager +$seeded total=${persons.size}")
-        }
-
-        // 2) Request full list refresh (QA doRequestFlRefresh)
+        val parts = mutableListOf<String>()
+        persons.clear()
         pendingChunks.clear()
-        requestFriendListRefresh(cl)
+        lastCompleteTotal = -1
 
-        // 3) Wait for complete chunk assembly OR timeout with growth
+        // A) Classic FriendsManager seed
+        val s1 = seedFromFriendsManager(cl)
+        parts += "mgr=$s1"
+        if (s1 > 0) lastSourceTag = "FriendsManager"
+
+        // B) All-managers scan (NT often stores elsewhere)
+        val s2 = seedScanAllManagers(cl, owner)
+        parts += "scan=$s2"
+        if (s2 > 0 && lastSourceTag == "none") lastSourceTag = "ManagerScan"
+
+        // C) Runtime services
+        val s3 = seedRuntimeServices(cl, owner)
+        parts += "svc=$s3"
+        if (s3 > 0 && lastSourceTag == "none") lastSourceTag = "RuntimeService"
+
+        // D) Request FL refresh + wait chunks
+        requestFriendListRefresh(cl)
         val deadline = System.currentTimeMillis() + timeoutMs
         var last = persons.size
         var stable = 0
         while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(300)
-            // re-seed manager in case QQ filled it after refresh
+            Thread.sleep(350)
             seedFromFriendsManager(cl)
+            seedScanAllManagers(cl, owner)
             val now = persons.size
             if (now == last) {
                 stable++
-                // complete if we hit reported total, or large stable list
                 if (lastCompleteTotal > 0 && now >= lastCompleteTotal - 2) break
-                if (stable >= 6 && now >= 50) break
+                if (stable >= 8 && now >= 80) break
+                if (stable >= 12 && now >= 20) break
             } else {
                 stable = 0
                 last = now
             }
         }
 
-        // filter self
+        // E) Entity table last resort
+        if (persons.size < 20) {
+            val s4 = seedEntityFriendsTable(cl, owner)
+            parts += "ent=$s4"
+            if (s4 > 0) lastSourceTag = "EntityTable"
+        }
+
         persons.remove(owner)
+        // drop garbage serials if list looks fake
+        if (UinUtil.looksLikeSerialGarbage(persons.keys)) {
+            Log.w("Dropping serial-garbage roster size=${persons.size}")
+            persons.clear()
+            parts += "droppedGarbage"
+        } else {
+            // still drop 10000–10099 if we have a large real list
+            if (persons.size > 50) {
+                val drop = persons.keys.filter { UinUtil.isSuspiciousLowSerial(it) }
+                drop.forEach { persons.remove(it) }
+                if (drop.isNotEmpty()) parts += "dropLow=${drop.size}"
+            }
+        }
+
+        lastDiag = parts.joinToString(" ")
+        Log.i("FriendRoster done size=${persons.size} tag=$lastSourceTag $lastDiag hint=$lastCompleteTotal")
 
         if (persons.isEmpty()) {
             throw IllegalStateException(
-                "roster empty after refresh. " +
-                    "seeded=$seeded completeHint=$lastCompleteTotal " +
-                    "try open 联系人 then refresh"
+                "roster empty. $lastDiag hint=$lastCompleteTotal. " +
+                    "Open 联系人, pull-to-refresh, then 立即刷新 again."
             )
         }
-        if (lastSourceTag == "FriendsManager" && pendingChunks.isNotEmpty()) {
-            lastSourceTag = "FriendsManager+Resp"
-        } else if (persons.isNotEmpty() && lastSourceTag == "none") {
-            lastSourceTag = "Resp"
-        }
-        Log.i("FriendRoster fetch done size=${persons.size} tag=$lastSourceTag hint=$lastCompleteTotal")
         return snapshot()
     }
 
-    // ---------------- hooks ----------------
+    // ---------- put helper ----------
 
-    private fun hookGetFriendListResp(cl: ClassLoader) {
-        val clazz = XposedHelpers.findClassIfExists("friendlist.GetFriendListResp", cl)
-            ?: XposedHelpers.findClassIfExists("Lfriendlist/GetFriendListResp;", cl)
-        if (clazz == null) {
-            Log.w("GetFriendListResp class not found")
-            return
+    private fun putFriend(uinRaw: String?, remark: String?, nick: String?): Boolean {
+        val uin = UinUtil.normalize(uinRaw) ?: return false
+        val display = when {
+            !remark.isNullOrBlank() -> remark
+            !nick.isNullOrBlank() -> nick
+            else -> uin
         }
-        var n = 0
-        for (m in clazz.declaredMethods) {
-            if (m.name != "readFrom") continue
-            try {
-                XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        runCatching { onGetFriendListResp(param.thisObject) }
-                            .onFailure { Log.d("onGetFriendListResp: ${it.message}") }
-                    }
-                })
-                n++
-            } catch (t: Throwable) {
-                Log.d("hook readFrom: ${t.message}")
-            }
-        }
-        Log.i("Hooked GetFriendListResp.readFrom x$n")
+        persons[uin] = FriendEntry(uin, display, nick, FriendSource.API)
+        return true
     }
 
-    /**
-     * Mirror QA FriendChunk.fromGetFriendListResp + ExfriendManager.recordFriendChunk.
-     */
+    // ---------- hooks ----------
+
+    private fun hookGetFriendListResp(cl: ClassLoader) {
+        val names = listOf(
+            "friendlist.GetFriendListResp",
+            "friendlist.GetFriendListRespV2",
+            "tencent.im.oidb.cmd0x5d2.Oidb_0x5d2\$RspBody"
+        )
+        var hooked = 0
+        for (cn in names) {
+            val clazz = XposedHelpers.findClassIfExists(cn, cl) ?: continue
+            for (m in clazz.declaredMethods) {
+                if (m.name != "readFrom" && m.name != "mergeFrom" && m.name != "parseFrom") continue
+                try {
+                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            runCatching { onGetFriendListResp(param.thisObject) }
+                        }
+                    })
+                    hooked++
+                } catch (_: Throwable) {
+                }
+            }
+            if (hooked > 0) {
+                Log.i("Hooked $cn ($hooked methods)")
+                break
+            }
+        }
+        if (hooked == 0) Log.w("GetFriendListResp not found (NT may not use it)")
+    }
+
+    private fun hookFriendsEntity(cl: ClassLoader) {
+        val clazz = XposedHelpers.findClassIfExists("com.tencent.mobileqq.data.Friends", cl) ?: return
+        try {
+            for (m in clazz.declaredMethods) {
+                if (m.name != "readFrom" && m.name != "entityByCursor" && m.name != "readEntity") continue
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        runCatching {
+                            val o = param.thisObject
+                            val uin = strField(o, "uin")
+                            val remark = strField(o, "remark")
+                            val nick = strField(o, "name")
+                            putFriend(uin, remark, nick)
+                        }
+                    }
+                })
+            }
+            Log.i("Hooked Friends entity readers")
+        } catch (t: Throwable) {
+            Log.d("Friends entity hook: ${t.message}")
+        }
+    }
+
     private fun onGetFriendListResp(resp: Any) {
         val startIndex = intField(resp, "startIndex")
         val friendCount = intField(resp, "friend_count")
         val total = intField(resp, "totoal_friend_count").let {
-            // handle possible spelling variants
             if (it > 0) it else intField(resp, "total_friend_count")
         }
-        val owner = longField(resp, "uin")
-        val serverTime = longField(resp, "serverTime").let {
-            if (it > 0) it else System.currentTimeMillis() / 1000
-        }
-        if (friendCount <= 0 && total <= 0) return
-
         val list = parseVecFriendInfo(resp)
-        if (list.isEmpty() && friendCount > 0) {
-            Log.d("GetFriendListResp chunk empty parse start=$startIndex count=$friendCount")
-            return
-        }
+        if (list.isEmpty() && friendCount <= 0) return
 
         val chunk = Chunk(
-            ownerUin = owner,
             startIndex = startIndex,
             friendCount = if (friendCount > 0) friendCount else list.size,
             totalFriendCount = total,
-            serverTime = serverTime,
             friends = list
         )
-
         synchronized(pendingChunks) {
-            if (chunk.startIndex == 0) {
-                pendingChunks.clear()
-            }
+            if (chunk.startIndex == 0) pendingChunks.clear()
             pendingChunks.add(chunk)
-            // merge into persons immediately (progressive)
-            for (f in chunk.friends) {
-                persons[f.uin] = f
-            }
+            list.forEach { persons[it.uin] = it }
             lastSourceTag = "Resp"
-            if (chunk.totalFriendCount > 0) lastCompleteTotal = chunk.totalFriendCount
-
-            // integrity: sum(friend_count) == total (QA: subtract each chunk from total → 0)
-            if (chunk.totalFriendCount > 0) {
-                var left = chunk.totalFriendCount
+            if (total > 0) lastCompleteTotal = total
+            if (total > 0) {
+                var left = total
                 for (c in pendingChunks) left -= c.friendCount
-                Log.i(
-                    "FL chunk start=${chunk.startIndex} n=${chunk.friendCount} " +
-                        "total=${chunk.totalFriendCount} left=$left roster=${persons.size}"
-                )
+                Log.i("FL chunk start=$startIndex n=${chunk.friendCount} total=$total left=$left size=${persons.size}")
                 if (left == 0) {
-                    // complete page set
-                    lastCompleteTotal = chunk.totalFriendCount
                     lastSourceTag = "RespComplete"
-                    Log.i("Friend list COMPLETE roster=${persons.size} expected=$lastCompleteTotal")
+                    lastCompleteTotal = total
                     pendingChunks.clear()
                 }
-            } else {
-                Log.i("FL chunk start=${chunk.startIndex} n=${list.size} roster=${persons.size}")
             }
         }
     }
@@ -230,23 +271,23 @@ object FriendRoster {
                 val uin = friendInfoUin(info) ?: continue
                 val remark = strField(info, "remark")
                 val nick = strField(info, "nick") ?: strField(info, "name")
-                val display = when {
-                    !remark.isNullOrBlank() -> remark
-                    !nick.isNullOrBlank() -> nick
-                    else -> uin
-                }
-                out.add(FriendEntry(uin, display, nick, FriendSource.API))
+                out.add(
+                    FriendEntry(
+                        uin,
+                        remark?.takeIf { it.isNotBlank() } ?: nick?.takeIf { it.isNotBlank() } ?: uin,
+                        nick,
+                        FriendSource.API
+                    )
+                )
             }
             return out
         }
-        // fallback field walk
         for (f in resp.javaClass.declaredFields) {
             try {
                 f.isAccessible = true
                 val v = f.get(resp) as? List<*> ?: continue
                 if (v.isEmpty()) continue
-                val sample = v[0] ?: continue
-                if (friendInfoUin(sample) == null) continue
+                if (friendInfoUin(v[0] ?: continue) == null) continue
                 for (info in v) {
                     if (info == null) continue
                     val uin = friendInfoUin(info) ?: continue
@@ -269,7 +310,6 @@ object FriendRoster {
     }
 
     private fun friendInfoUin(info: Any): String? {
-        // QA: FriendInfo.friendUin is long
         for (n in listOf("friendUin", "uin", "lFriendUIN", "uFriendUin")) {
             try {
                 val f = info.javaClass.getField(n)
@@ -286,92 +326,53 @@ object FriendRoster {
         return null
     }
 
-    // ---------------- FriendsManager seed (exact QA algorithm) ----------------
+    // ---------- seed paths ----------
 
     private fun seedFromFriendsManager(cl: ClassLoader): Int {
         return try {
             val map = getFriendsConcurrentHashMap(cl) ?: return 0
             val friendsClz = XposedHelpers.findClass("com.tencent.mobileqq.data.Friends", cl)
-            val fUin = friendsClz.getField("uin") // String in QA comments "long!!!" but used as String parse
-            fUin.isAccessible = true
+            val fUin = friendsClz.getField("uin").also { it.isAccessible = true }
             val fRemark = friendsClz.getField("remark").also { it.isAccessible = true }
             val fNick = friendsClz.getField("name").also { it.isAccessible = true }
-            var added = 0
-            for (entry in map.entries) {
-                val fr = entry.value ?: continue
-                if (!friendsClz.isInstance(fr)) continue
-                val rawUin = fUin.get(fr)?.toString() ?: continue
-                val uin = UinUtil.normalize(rawUin) ?: continue
-                val remark = fRemark.get(fr)?.toString()
-                val nick = fNick.get(fr)?.toString()
-                val display = when {
-                    !remark.isNullOrBlank() -> remark
-                    !nick.isNullOrBlank() -> nick
-                    else -> uin
-                }
-                if (persons.putIfAbsent(uin, FriendEntry(uin, display, nick, FriendSource.API)) == null) {
-                    added++
-                } else {
-                    // refresh names
-                    persons[uin] = FriendEntry(uin, display, nick, FriendSource.API)
+            var n = 0
+            for (fr in map.values) {
+                if (fr == null || !friendsClz.isInstance(fr)) continue
+                if (putFriend(fUin.get(fr)?.toString(), fRemark.get(fr)?.toString(), fNick.get(fr)?.toString())) {
+                    n++
                 }
             }
-            added
+            n
         } catch (t: Throwable) {
             Log.d("seedFromFriendsManager: ${t.message}")
             0
         }
     }
 
-    /**
-     * QA:
-     * getFriendsManager = appRuntime.getManager(50)
-     * getFriendsConcurrentHashMap: first ConcurrentHashMap field whose values are Friends.
-     */
     private fun getFriendsConcurrentHashMap(cl: ClassLoader): ConcurrentHashMap<*, *>? {
         val app = getAppRuntime(cl) ?: return null
         val mgr = try {
             XposedHelpers.callMethod(app, "getManager", 50)
-        } catch (t: Throwable) {
-            Log.d("getManager(50): ${t.message}")
-            // scan for FriendsManager
-            scanFriendsManager(app)
-        } ?: return null
+        } catch (_: Throwable) {
+            null
+        } ?: scanFriendsManager(app) ?: return null
 
         val friendsClz = XposedHelpers.findClassIfExists("com.tencent.mobileqq.data.Friends", cl)
             ?: return null
 
-        // Prefer declared type ConcurrentHashMap exactly like QA
         var c: Class<*>? = mgr.javaClass
         while (c != null && c != Any::class.java) {
             for (field in c.declaredFields) {
                 try {
-                    if (field.type != ConcurrentHashMap::class.java) continue
-                    field.isAccessible = true
-                    val map = field.get(mgr) as? ConcurrentHashMap<*, *> ?: continue
-                    if (map.isEmpty()) continue
-                    val sample = map[map.keys.first()] ?: continue
-                    if (friendsClz.isInstance(sample)) {
-                        Log.i("Friends map field=${field.name} size=${map.size} cls=${mgr.javaClass.name}")
-                        return map
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-            c = c.superclass
-        }
-        // Any Map with Friends values
-        c = mgr.javaClass
-        while (c != null && c != Any::class.java) {
-            for (field in c.declaredFields) {
-                try {
-                    if (!MutableMap::class.java.isAssignableFrom(field.type)) continue
+                    if (field.type != ConcurrentHashMap::class.java &&
+                        !MutableMap::class.java.isAssignableFrom(field.type)
+                    ) continue
                     field.isAccessible = true
                     val map = field.get(mgr) as? Map<*, *> ?: continue
                     if (map.isEmpty()) continue
                     val sample = map.values.firstOrNull() ?: continue
                     if (friendsClz.isInstance(sample)) {
-                        Log.i("Friends map(any) field=${field.name} size=${map.size}")
+                        Log.i("Friends map ${field.name} size=${map.size} on ${mgr.javaClass.simpleName}")
                         return if (map is ConcurrentHashMap<*, *>) map else ConcurrentHashMap(map)
                     }
                 } catch (_: Throwable) {
@@ -379,29 +380,195 @@ object FriendRoster {
             }
             c = c.superclass
         }
-        Log.d("No Friends ConcurrentHashMap on ${mgr.javaClass.name}")
         return null
     }
 
     private fun scanFriendsManager(app: Any): Any? {
-        for (id in 0..100) {
+        for (id in 0..120) {
             try {
                 val m = XposedHelpers.callMethod(app, "getManager", id) ?: continue
-                if (m.javaClass.name.contains("FriendsManager")) {
-                    Log.i("FriendsManager found id=$id")
-                    return m
-                }
+                if (m.javaClass.name.contains("FriendsManager")) return m
             } catch (_: Throwable) {
             }
         }
         return null
     }
 
-    // ---------------- refresh ----------------
+    private fun seedScanAllManagers(cl: ClassLoader, owner: String): Int {
+        val app = getAppRuntime(cl) ?: return 0
+        val friendsClz = XposedHelpers.findClassIfExists("com.tencent.mobileqq.data.Friends", cl)
+        var added = 0
+        for (id in 0..120) {
+            val mgr = try {
+                XposedHelpers.callMethod(app, "getManager", id)
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+            added += collectFriendsFromObject(mgr, friendsClz, owner, depth = 0)
+        }
+        return added
+    }
+
+    private fun collectFriendsFromObject(
+        target: Any,
+        friendsClz: Class<*>?,
+        owner: String,
+        depth: Int
+    ): Int {
+        if (depth > 1) return 0
+        var added = 0
+        var c: Class<*>? = target.javaClass
+        while (c != null && c != Any::class.java) {
+            for (field in c.declaredFields) {
+                try {
+                    if (Modifier.isStatic(field.modifiers)) continue
+                    if (!MutableMap::class.java.isAssignableFrom(field.type)) continue
+                    field.isAccessible = true
+                    val map = field.get(target) as? Map<*, *> ?: continue
+                    if (map.isEmpty() || map.size > 200000) continue
+                    val sample = map.values.firstOrNull() ?: continue
+                    val isFriends = friendsClz != null && friendsClz.isInstance(sample)
+                    val looksFriend = isFriends || sample.javaClass.name.contains("Friend", true)
+                    if (!looksFriend && map.size < 30) continue
+                    for ((k, v) in map) {
+                        if (v == null) continue
+                        val uin = when {
+                            isFriends || friendsClz?.isInstance(v) == true ->
+                                strField(v, "uin")
+                            looksFriend ->
+                                strField(v, "uin") ?: strField(v, "friendUin")
+                            else -> null
+                        } ?: continue
+                        if (uin == owner) continue
+                        val remark = strField(v, "remark")
+                        val nick = strField(v, "name") ?: strField(v, "nick")
+                        if (putFriend(uin, remark, nick)) added++
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            c = c.superclass
+        }
+        return added
+    }
+
+    private fun seedRuntimeServices(cl: ClassLoader, owner: String): Int {
+        val app = getAppRuntime(cl) ?: return 0
+        val names = listOf(
+            "com.tencent.mobileqq.friend.api.IFriendDataService",
+            "com.tencent.mobileqq.friend.api.IFriendHandlerService",
+            "com.tencent.mobileqq.relation.api.IRelationService"
+        )
+        var added = 0
+        for (sn in names) {
+            try {
+                val iface = XposedHelpers.findClassIfExists(sn, cl) ?: continue
+                val svc = runCatching {
+                    XposedHelpers.callMethod(app, "getRuntimeService", iface, "all")
+                }.getOrNull() ?: continue
+                Log.d("svc $sn -> ${svc.javaClass.name}")
+                for (m in svc.javaClass.methods) {
+                    if (m.parameterTypes.isNotEmpty()) continue
+                    if (Modifier.isStatic(m.modifiers)) continue
+                    val n = m.name.lowercase()
+                    if (!(n.contains("friend") || n.contains("buddy") || n.contains("all"))) continue
+                    try {
+                        m.isAccessible = true
+                        val raw = m.invoke(svc) ?: continue
+                        added += absorbAnyList(raw, owner)
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.d("svc $sn: ${t.message}")
+            }
+        }
+        return added
+    }
+
+    private fun absorbAnyList(raw: Any, owner: String): Int {
+        val col: Collection<*> = when (raw) {
+            is Collection<*> -> raw
+            is Map<*, *> -> raw.values
+            is Array<*> -> raw.toList()
+            else -> return 0
+        }
+        var n = 0
+        for (item in col) {
+            if (item == null) continue
+            val uin = strField(item, "uin") ?: strField(item, "friendUin") ?: continue
+            if (uin == owner) continue
+            val remark = strField(item, "remark")
+            val nick = strField(item, "name") ?: strField(item, "nick")
+            if (putFriend(uin, remark, nick)) n++
+        }
+        return n
+    }
 
     /**
-     * QA ManagerHelper.getFriendListHandler + Reflex.invokeVirtualAny(h, true, true, boolean, boolean, void)
+     * Try QQ EntityManager: select * style for Friends entity class.
      */
+    private fun seedEntityFriendsTable(cl: ClassLoader, owner: String): Int {
+        return try {
+            val friendsClz = XposedHelpers.findClassIfExists("com.tencent.mobileqq.data.Friends", cl)
+                ?: return 0
+            val app = getAppRuntime(cl) ?: return 0
+            // Common: EntityManagerFactoryHelper / getEntityManagerFactory
+            val emCandidates = mutableListOf<Any?>()
+            for (m in app.javaClass.methods) {
+                if (m.parameterTypes.isNotEmpty()) continue
+                val n = m.name.lowercase()
+                if (!(n.contains("entity") || n.contains("em"))) continue
+                try {
+                    m.isAccessible = true
+                    emCandidates += m.invoke(app)
+                } catch (_: Throwable) {
+                }
+            }
+            // also getManager factory patterns
+            for (id in 0..80) {
+                try {
+                    val mgr = XposedHelpers.callMethod(app, "getManager", id) ?: continue
+                    if (mgr.javaClass.name.contains("Entity", true) ||
+                        mgr.javaClass.name.contains("SQLite", true)
+                    ) {
+                        emCandidates += mgr
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            var added = 0
+            for (em in emCandidates.filterNotNull()) {
+                // query(Class) or query(Class, boolean)
+                for (m in em.javaClass.methods) {
+                    if (m.name != "query" && m.name != "findAll" && m.name != "tabQuery") continue
+                    try {
+                        m.isAccessible = true
+                        val raw = when {
+                            m.parameterTypes.size == 1 && m.parameterTypes[0] == Class::class.java ->
+                                m.invoke(em, friendsClz)
+                            m.parameterTypes.size == 2 && m.parameterTypes[0] == Class::class.java ->
+                                m.invoke(em, friendsClz, true)
+                            else -> null
+                        } ?: continue
+                        val n = absorbAnyList(raw, owner)
+                        if (n > 0) {
+                            Log.i("Entity query via ${em.javaClass.simpleName}.${m.name} +$n")
+                            added += n
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            added
+        } catch (t: Throwable) {
+            Log.d("seedEntityFriendsTable: ${t.message}")
+            0
+        }
+    }
+
+    // ---------- refresh ----------
+
     private fun requestFriendListRefresh(cl: ClassLoader) {
         try {
             val handler = getFriendListHandler(cl) ?: run {
@@ -409,7 +576,6 @@ object FriendRoster {
                 return
             }
             Log.i("FriendListHandler=${handler.javaClass.name}")
-            // Exact: public void xxx(boolean, boolean)
             for (m in handler.javaClass.methods) {
                 if (!Modifier.isPublic(m.modifiers)) continue
                 if (m.parameterTypes.size != 2) continue
@@ -419,7 +585,7 @@ object FriendRoster {
                 try {
                     m.isAccessible = true
                     m.invoke(handler, true, true)
-                    Log.i("FL refresh invoked ${m.declaringClass.simpleName}.${m.name}(true,true)")
+                    Log.i("FL refresh ${m.name}(true,true)")
                 } catch (t: Throwable) {
                     Log.d("invoke ${m.name}: ${t.message}")
                 }
@@ -432,7 +598,6 @@ object FriendRoster {
     private fun getFriendListHandler(cl: ClassLoader): Any? {
         val app = getAppRuntime(cl) ?: return null
         val name = "com.tencent.mobileqq.app.FriendListHandler"
-        // getBusinessHandler(String)
         for (m in app.javaClass.methods) {
             if (m.name != "getBusinessHandler") continue
             try {
@@ -441,7 +606,6 @@ object FriendRoster {
                     return m.invoke(app, name)
                 }
                 if (m.parameterTypes.size == 1 && m.parameterTypes[0] == Int::class.javaPrimitiveType) {
-                    // classic id 1
                     return m.invoke(app, 1)
                 }
             } catch (_: Throwable) {
@@ -450,7 +614,7 @@ object FriendRoster {
         return runCatching { XposedHelpers.callMethod(app, "getBusinessHandler", name) }.getOrNull()
     }
 
-    // ---------------- runtime helpers ----------------
+    // ---------- runtime ----------
 
     private fun getAppRuntime(cl: ClassLoader): Any? {
         try {
@@ -499,8 +663,7 @@ object FriendRoster {
 
     private fun intField(obj: Any, name: String): Int {
         return try {
-            val f = obj.javaClass.getField(name)
-            when (val v = f.get(obj)) {
+            when (val v = obj.javaClass.getField(name).get(obj)) {
                 is Int -> v
                 is Short -> v.toInt()
                 is Number -> v.toInt()
@@ -510,33 +673,11 @@ object FriendRoster {
             try {
                 when (val v = XposedHelpers.getObjectField(obj, name)) {
                     is Int -> v
-                    is Short -> v.toInt()
                     is Number -> v.toInt()
                     else -> 0
                 }
             } catch (_: Throwable) {
                 0
-            }
-        }
-    }
-
-    private fun longField(obj: Any, name: String): Long {
-        return try {
-            val f = obj.javaClass.getField(name)
-            when (val v = f.get(obj)) {
-                is Long -> v
-                is Number -> v.toLong()
-                else -> 0L
-            }
-        } catch (_: Throwable) {
-            try {
-                when (val v = XposedHelpers.getObjectField(obj, name)) {
-                    is Long -> v
-                    is Number -> v.toLong()
-                    else -> 0L
-                }
-            } catch (_: Throwable) {
-                0L
             }
         }
     }
