@@ -20,7 +20,6 @@ import android.widget.BaseAdapter
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
-import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
@@ -422,19 +421,8 @@ object DetectorPanel {
                 .show()
         }
 
-        // Scrollable shell for small screens
-        val scroll = ScrollView(activity).apply {
-            isFillViewport = true
-            addView(
-                outer,
-                ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            )
-        }
-        // Note: nested ListView in ScrollView is bad; keep list fixed height instead.
-        // Rebuild without outer ScrollView — use LinearLayout only
+        // Do not wrap in ScrollView here — attaching outer to ScrollView then
+        // returning outer causes "The specified child already has a parent".
         refreshStatusAndList()
         return outer
     }
