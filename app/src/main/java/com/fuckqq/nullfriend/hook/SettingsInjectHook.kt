@@ -2,29 +2,35 @@ package com.fuckqq.nullfriend.hook
 
 import android.app.Activity
 import android.content.Intent
-import android.view.View
-import android.view.ViewGroup
-import android.widget.TextView
-import com.fuckqq.nullfriend.ui.DetectorActivity
+import com.fuckqq.nullfriend.Constants
+import com.fuckqq.nullfriend.ModuleMain
+import com.fuckqq.nullfriend.ui.DetectorPanel
 import com.fuckqq.nullfriend.util.Log
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.util.WeakHashMap
 
 /**
- * Best-effort: when QQ About/Settings activity resumes, offer a floating entry.
- * Full settings-list inject is version-fragile; activity entry is more reliable for v0.1.
+ * Injects a floating entry on common QQ activities and opens in-process panel.
  */
 object SettingsInjectHook {
 
-    private val settingsHints = listOf(
-        "Settings",
-        "Setting",
-        "About",
-        "QQSetting",
-        "SettingsActivity",
-        "SettingActivity"
+    /** Prefer main shell / me / contacts / settings; avoid pure AIO chat spam if possible */
+    private val preferHints = listOf(
+        "Splash", "Main", "Frame", "Home", "Tab",
+        "Setting", "About", "Leba", "Contact", "Friend",
+        "Mine", "Profile", "Account", "QQSetting", "Drawer",
+        "Conversation", "Recent", "Login", "Gesture"
     )
+
+    /** Always inject on these strong matches */
+    private val alwaysHints = listOf(
+        "SplashActivity", "MainActivity", "MainFragmentActivity",
+        "QQSetting", "SettingsActivity", "SettingActivity"
+    )
+
+    private val attached = WeakHashMap<Activity, Boolean>()
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
@@ -33,66 +39,69 @@ object SettingsInjectHook {
                 "onResume",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val activity = param.thisObject as Activity
-                        if (activity.packageName != "com.tencent.mobileqq") return
-                        val name = activity.javaClass.name
-                        if (settingsHints.none { name.contains(it, ignoreCase = true) }) return
-                        injectEntryButton(activity)
+                        val activity = param.thisObject as? Activity ?: return
+                        if (activity.packageName != Constants.QQ_PACKAGE) return
+                        maybeAttach(activity)
+                        maybeOpenFromIntent(activity)
                     }
                 }
             )
-            Log.i("SettingsInjectHook installed")
+            // Also onCreate for early attach
+            XposedHelpers.findAndHookMethod(
+                Activity::class.java,
+                "onPostCreate",
+                android.os.Bundle::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val activity = param.thisObject as? Activity ?: return
+                        if (activity.packageName != Constants.QQ_PACKAGE) return
+                        maybeAttach(activity)
+                        maybeOpenFromIntent(activity)
+                    }
+                }
+            )
+            Log.i("SettingsInjectHook installed (FAB + intent)")
         } catch (t: Throwable) {
             Log.e("SettingsInjectHook failed", t)
         }
     }
 
-    private fun injectEntryButton(activity: Activity) {
+    private fun maybeAttach(activity: Activity) {
+        val name = activity.javaClass.name
+        val noisy = name.contains("WebView", true) ||
+            name.contains("Translucent", true) ||
+            name.contains("Proxy", true) ||
+            name.contains("Dialog", true) ||
+            name.contains("Plugin", true)
+        if (noisy) return
+
+        val strong = alwaysHints.any { name.contains(it, ignoreCase = true) }
+        val soft = preferHints.any { name.contains(it, ignoreCase = true) }
+        // Only attach on main shell / settings-like pages (not every chat Activity)
+        if (!strong && !soft) return
+        if (attached.put(activity, true) == true) return
+        ModuleMain.ensureInit(activity.applicationContext)
+        DetectorPanel.attachFab(activity)
+    }
+
+    private fun maybeOpenFromIntent(activity: Activity) {
         try {
-            val decor = activity.window.decorView as? ViewGroup ?: return
-            if (decor.findViewWithTag<View>(TAG) != null) return
-            val tv = TextView(activity).apply {
-                tag = TAG
-                text = "去TM的单向好友"
-                textSize = 14f
-                setPadding(28, 20, 28, 20)
-                setBackgroundColor(0xE0FF5722.toInt())
-                setTextColor(0xFFFFFFFF.toInt())
-                setOnClickListener {
-                    val i = Intent(activity, DetectorActivity::class.java).apply {
-                        action = "com.fuckqq.nullfriend.OPEN_DETECTOR"
-                    }
-                    // Load activity from module — may need module classloader context
-                    try {
-                        activity.startActivity(i)
-                    } catch (t: Throwable) {
-                        Log.e("start DetectorActivity", t)
-                        // Fallback: explicit component from module package
-                        try {
-                            val alt = Intent().setClassName(
-                                "com.fuckqq.nullfriend",
-                                "com.fuckqq.nullfriend.ui.DetectorActivity"
-                            )
-                            activity.startActivity(alt)
-                        } catch (t2: Throwable) {
-                            Log.e("fallback start activity", t2)
-                        }
-                    }
-                }
-            }
-            val lp = ViewGroup.MarginLayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 120
-                marginStart = 24
-            }
-            decor.addView(tv, lp)
-            Log.d("Injected entry on ${activity.javaClass.name}")
+            val intent = activity.intent ?: return
+            val open = intent.getBooleanExtra(EXTRA_OPEN_PANEL, false) ||
+                intent.action == ACTION_OPEN_PANEL ||
+                intent.getStringExtra("open_nullfriend") == "1"
+            if (!open) return
+            // consume
+            intent.removeExtra(EXTRA_OPEN_PANEL)
+            intent.removeExtra("open_nullfriend")
+            ModuleMain.ensureInit(activity.applicationContext)
+            DetectorPanel.show(activity)
+            Log.i("Opened panel from intent on ${activity.javaClass.name}")
         } catch (t: Throwable) {
-            Log.d("injectEntry: ${t.message}")
+            Log.d("maybeOpenFromIntent: ${t.message}")
         }
     }
 
-    private const val TAG = "fuckqq_nullfriend_entry"
+    const val EXTRA_OPEN_PANEL = "fuckqq_nullfriend_open"
+    const val ACTION_OPEN_PANEL = "com.fuckqq.nullfriend.action.OPEN_PANEL"
 }

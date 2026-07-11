@@ -25,7 +25,8 @@ object ModuleMain {
     @Volatile
     var classLoader: ClassLoader? = null
 
-    private val inited = AtomicBoolean(false)
+    private val hooksInstalled = AtomicBoolean(false)
+    private val servicesReady = AtomicBoolean(false)
 
     lateinit var prefs: Prefs
         private set
@@ -34,14 +35,17 @@ object ModuleMain {
     lateinit var detectionService: DetectionService
         private set
 
+    fun isReady(): Boolean = servicesReady.get() && appContext != null
+
     fun onQqLoaded(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (!inited.compareAndSet(false, true)) return
         classLoader = lpparam.classLoader
         Log.i("Loading in ${lpparam.packageName} process=${lpparam.processName}")
 
-        hookApplicationCreate(lpparam)
-        SettingsInjectHook.install(lpparam)
-        StartupHook.install(lpparam)
+        if (hooksInstalled.compareAndSet(false, true)) {
+            hookApplicationCreate(lpparam)
+            SettingsInjectHook.install(lpparam)
+            StartupHook.install(lpparam)
+        }
     }
 
     private fun hookApplicationCreate(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -53,9 +57,7 @@ object ModuleMain {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val app = param.thisObject as Application
                         if (app.packageName != Constants.QQ_PACKAGE) return
-                        // Prefer main process
-                        if (appContext != null) return
-                        initWithContext(app.applicationContext)
+                        ensureInit(app.applicationContext)
                     }
                 }
             )
@@ -64,20 +66,31 @@ object ModuleMain {
         }
     }
 
-    fun initWithContext(context: Context) {
-        if (appContext != null) return
-        appContext = context.applicationContext
-        prefs = Prefs(context)
-        repository = DetectorRepository(context)
-        val provider = HybridFriendListProvider(context, classLoader)
-        detectionService = DetectionService(
-            repository = repository,
-            provider = provider,
-            prefs = prefs,
-            notifier = Notifier(context)
-        )
-        Log.i("Module services ready")
-        detectionService.scheduleStartupCheck()
-        detectionService.reschedulePeriodic()
+    @Synchronized
+    fun ensureInit(context: Context) {
+        if (servicesReady.get() && appContext != null) return
+        try {
+            val ctx = context.applicationContext
+            appContext = ctx
+            prefs = Prefs(ctx)
+            repository = DetectorRepository(ctx)
+            val provider = HybridFriendListProvider(ctx, classLoader)
+            detectionService = DetectionService(
+                repository = repository,
+                provider = provider,
+                prefs = prefs,
+                notifier = Notifier(ctx)
+            )
+            servicesReady.set(true)
+            Log.i("Module services ready")
+            detectionService.scheduleStartupCheck()
+            detectionService.reschedulePeriodic()
+        } catch (t: Throwable) {
+            Log.e("ensureInit failed", t)
+            servicesReady.set(false)
+        }
     }
+
+    /** @deprecated use ensureInit */
+    fun initWithContext(context: Context) = ensureInit(context)
 }
