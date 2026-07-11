@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">去TM的单向好友</string>
+    <string name="xposed_description">检测 QQ 好友列表消失（被删/单向）。作用域仅 com.tencent.mobileqq。数据仅存本机。</string>
+    <string name="settings_entry_title">去TM的单向好友</string>
+    <string name="disclaimer_who_deleted">列表中消失可能是对方删除、自己删除或其他关系变化，模块无法区分。</string>
+</resources>
