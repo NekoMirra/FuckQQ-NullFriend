@@ -34,57 +34,84 @@ class HybridFriendListProvider(
             val owner = resolveOwnerUin()
                 ?: throw IllegalStateException("Cannot resolve account uin")
 
-            val errors = mutableListOf<String>()
-
-            // 1) Classic FriendsManager map (QA path)
-            val s1 = runCatching { loadFromFriendsManager() }.getOrElse {
-                errors += "FriendsManager:${it.message}"; null
-            }
-            if (!s1.isNullOrEmpty()) return@runCatching success(owner, s1, FriendSource.API, "FriendsManager")
-
-            // 2) Request network refresh then retry
+            // Always request a full list refresh first (QA: FriendListHandler true,true)
+            // GetFriendListResp comes in chunks; wait and merge.
+            FriendListRespCache.markRefreshStart()
             requestFriendListRefresh()
-            Thread.sleep(1500)
-            val s2 = runCatching { loadFromFriendsManager() }.getOrNull()
-            if (!s2.isNullOrEmpty()) return@runCatching success(owner, s2, FriendSource.API, "FriendsManager@refresh")
 
-            // 3) Cached GetFriendListResp
-            val s3 = FriendListRespCache.snapshot()
-            if (s3.isNotEmpty()) return@runCatching success(owner, s3, FriendSource.API, "GetFriendListRespCache")
+            val merged = LinkedHashMap<String, FriendEntry>()
+            val tags = mutableListOf<String>()
 
-            // 4) Scan all managers for Maps holding friend-like objects
-            val s4 = runCatching { scanAllManagersForFriendMaps(owner) }.getOrElse {
-                errors += "scanMgr:${it.message}"; null
+            fun absorb(list: List<FriendEntry>?, tag: String) {
+                if (list.isNullOrEmpty()) return
+                var add = 0
+                for (f in list) {
+                    if (f.uin == owner) continue
+                    if (merged.putIfAbsent(f.uin, f) == null) add++
+                    else {
+                        // upgrade name if we only had uin
+                        val old = merged[f.uin]!!
+                        if (old.name == old.uin && f.name != f.uin) {
+                            merged[f.uin] = f
+                        }
+                    }
+                }
+                tags += "$tag+${list.size}/new$add"
+                Log.i("absorb $tag list=${list.size} merged=${merged.size}")
             }
-            if (!s4.isNullOrEmpty()) return@runCatching success(owner, s4, FriendSource.API, "ManagerScan")
 
-            // 5) Runtime service interfaces
-            val s5 = runCatching { loadFromRuntimeServices() }.getOrElse {
-                errors += "svc:${it.message}"; null
-            }
-            if (!s5.isNullOrEmpty()) return@runCatching success(owner, s5, FriendSource.API, "RuntimeService")
+            // Round 1: whatever is already in memory
+            absorb(runCatching { loadFromFriendsManager() }.getOrNull(), "FriendsManager")
+            absorb(FriendListRespCache.snapshot(), "RespCache0")
+            absorb(runCatching { scanAllManagersForFriendMaps(owner) }.getOrNull(), "MgrScan")
+            absorb(runCatching { loadFromRuntimeServices() }.getOrNull(), "Svc")
+            absorb(runCatching { scanDatabases(owner) }.getOrNull(), "DB")
 
-            // 6) Deep field walk on AppRuntime
-            val s6 = runCatching { walkRuntimeForFriends(owner) }.getOrElse {
-                errors += "walk:${it.message}"; null
+            // Round 2: wait for network chunks (friend list is paginated)
+            val deadline = System.currentTimeMillis() + 8_000
+            var lastSize = merged.size
+            var stable = 0
+            while (System.currentTimeMillis() < deadline) {
+                Thread.sleep(400)
+                absorb(FriendListRespCache.snapshot(), "RespCache")
+                absorb(runCatching { loadFromFriendsManager() }.getOrNull(), "FriendsManager2")
+                if (merged.size == lastSize) {
+                    stable++
+                    // if we already have a large list and no growth for ~1.6s, stop early
+                    if (stable >= 4 && merged.size >= 50) break
+                } else {
+                    stable = 0
+                    lastSize = merged.size
+                }
             }
-            if (!s6.isNullOrEmpty()) return@runCatching success(owner, s6, FriendSource.API, "RuntimeWalk")
 
-            // 7) Local SQLite
-            val s7 = runCatching { scanDatabases(owner) }.getOrElse {
-                errors += "db:${it.message}"; null
-            }
-            if (!s7.isNullOrEmpty()) return@runCatching success(owner, s7, FriendSource.DB, "SQLite")
+            // Round 3: last-chance walks
+            absorb(runCatching { walkRuntimeForFriends(owner) }.getOrNull(), "Walk")
+            absorb(runCatching { scanDatabases(owner) }.getOrNull(), "DB2")
 
-            // Diagnostics for next fix
-            val diag = buildString {
-                append("all sources empty. ")
-                append(dumpFriendsManagerDiag())
-                append(" cache=").append(FriendListRespCache.snapshot().size)
-                append(" err=").append(errors.joinToString(";"))
+            if (merged.isEmpty()) {
+                val diag = buildString {
+                    append("all sources empty. ")
+                    append(dumpFriendsManagerDiag())
+                    append(" cache=").append(FriendListRespCache.snapshot().size)
+                }
+                Log.w(diag)
+                throw IllegalStateException(diag.take(400))
             }
-            Log.w(diag)
-            throw IllegalStateException(diag.take(400))
+
+            val source = when {
+                tags.any { it.startsWith("DB") } &&
+                    !tags.any { it.startsWith("FriendsManager") || it.startsWith("Resp") } ->
+                    FriendSource.DB
+                else -> FriendSource.API
+            }
+            Log.i("Friend fetch merged=${merged.size} via ${tags.joinToString(",")}")
+            FriendListResult(
+                ownerUin = owner,
+                friends = merged.values.sortedBy { it.uin },
+                fetchedAt = System.currentTimeMillis(),
+                source = source
+            )
         }
     }
 
@@ -274,7 +301,16 @@ class HybridFriendListProvider(
                     if (!Map::class.java.isAssignableFrom(f.type)) continue
                     f.isAccessible = true
                     val map = f.get(target) as? Map<*, *> ?: continue
-                    if (map.isEmpty() || map.size > 50000) continue
+                    if (map.isEmpty() || map.size > 200000) continue
+                    // Prefer larger maps — classic full friend list is often hundreds+
+                    val sample = map.values.firstOrNull()
+                    val sampleKey = map.keys.firstOrNull()
+                    val keyLooksUin = UinUtil.normalize(sampleKey?.toString()) != null
+                    val valLooksFriend = sample != null && friendLikeness(sample) >= 1
+                    if (!keyLooksUin && !valLooksFriend && map.size < 20) {
+                        // skip tiny unrelated maps
+                        continue
+                    }
                     for ((k, v) in map.entries) {
                         if (v == null) continue
                         // key might be uin string
@@ -283,25 +319,20 @@ class HybridFriendListProvider(
                         val uin = fromVal ?: keyUin ?: continue
                         if (uin.length < 5) continue
                         if (out.containsKey(uin)) continue
-                        // Prefer objects that look like contacts
+                        // Prefer objects that look like contacts — but accept uin-keyed maps loosely
                         val score = friendLikeness(v)
-                        if (score < 1 && fromVal == null) continue
-                        if (score < 1 && keyUin != null) {
-                            // map keyed by uin but value not rich — still accept if value is String name
-                            val name = when (v) {
-                                is String -> v
-                                is CharSequence -> v.toString()
-                                else -> getStringField(v, "remark", "name", "nick", "nickname") ?: uin
-                            }
-                            out[uin] = FriendEntry(uin, name, null, FriendSource.API)
-                            continue
-                        }
-                        if (score >= 1) {
+                        val uinOk = uin.length in 5..12
+                        if (!uinOk) continue
+                        if (score < 1 && fromVal == null && keyUin == null) continue
+                        // Accept any map entry with a valid uin key or value
+                        if (score >= 1 || keyUin != null || fromVal != null) {
                             val remark = getStringField(v, "remark", "strRemark", "mRemark")
                             val nick = getStringField(v, "name", "nick", "nickname", "mName", "strNick")
                             val display = when {
                                 !remark.isNullOrBlank() -> remark
                                 !nick.isNullOrBlank() -> nick
+                                v is String && v != uin -> v
+                                v is CharSequence && v.toString() != uin -> v.toString()
                                 else -> uin
                             }
                             out[uin] = FriendEntry(uin, display, nick, FriendSource.API)
@@ -577,10 +608,16 @@ class HybridFriendListProvider(
             if (!f.name.endsWith(".db") && !f.name.endsWith(".db-wal")) continue
             if (f.name.endsWith("-wal") || f.name.endsWith("-shm")) continue
             val ln = f.name.lowercase()
-            // skip huge message dbs first pass unless name suggests friends
-            if (ln.contains("msg") && !ln.contains("friend") && !ln.contains("slowtable")) {
+            // Don't skip msg dbs entirely — some slowtable hold friend cards
+            if (ln.contains("msg") && !ln.contains("friend") && !ln.contains("slowtable") &&
+                !ln.contains("troop") && f.length() > 80L * 1024 * 1024
+            ) {
                 continue
             }
+            // Prefer friend-related names but also try all reasonably sized dbs
+            val prefer = ln.contains("friend") || ln.contains("buddy") || ln.contains("slowtable") ||
+                ln.contains("nt") || ln.contains("contact") || ln.startsWith("qq")
+            if (!prefer && f.length() > 30L * 1024 * 1024) continue
             tryReadDb(f, out)
         }
     }
@@ -600,13 +637,17 @@ class HybridFriendListProvider(
             for (table in tables) {
                 val tl = table.lowercase()
                 if (tl.startsWith("sqlite_") || tl.startsWith("android_")) continue
-                val interesting = tl.contains("friend") || tl.contains("buddy") ||
-                    tl.contains("troop_info").not() && (
-                        tl.contains("card") || tl.contains("contact") ||
-                            tl == "friends" || tl.contains("buddylist")
-                        )
-                if (!interesting && !tl.contains("friend")) continue
                 if (tl.contains("troop") && !tl.contains("friend")) continue
+                // Include friends/buddy/card/contact and also tables with uin columns we'll detect
+                val interesting = tl.contains("friend") || tl.contains("buddy") ||
+                    tl.contains("card") || tl.contains("contact") ||
+                    tl.contains("buddylist") || tl == "friends" ||
+                    tl.contains("group_friend") || tl.contains("stranger").not() &&
+                    (tl.contains("uin") || tl.contains("remark"))
+                if (!interesting) {
+                    // still try if table name is short and generic
+                    if (tl.length > 40) continue
+                }
                 readFriendTable(db, table, out)
             }
         } catch (t: Throwable) {

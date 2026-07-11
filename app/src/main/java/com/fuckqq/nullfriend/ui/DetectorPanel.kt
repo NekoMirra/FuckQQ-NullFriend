@@ -213,7 +213,7 @@ object DetectorPanel {
         // Move list below disclaimer for better layout: already added above; ok for v0.1.1
 
         btnRefresh.setOnClickListener {
-            status.text = "检测中…"
+            status.text = "检测中（合并全量好友，可能需数秒）…"
             service.refreshAsync { outcome ->
                 mainHandler.post {
                     val msg = when (outcome) {

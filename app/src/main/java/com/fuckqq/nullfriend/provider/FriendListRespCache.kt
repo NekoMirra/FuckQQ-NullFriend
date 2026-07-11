@@ -9,58 +9,126 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Cache friend list from network JCE response, same idea as QA DeletionObserver
- * hooking friendlist.GetFriendListResp.readFrom.
+ * Accumulates friend list from network JCE responses (chunked).
+ * Pattern from QAuxiliary DeletionObserver + FriendChunk.
  */
 object FriendListRespCache {
     private val byUin = ConcurrentHashMap<String, FriendEntry>()
+    private val chunkCount = AtomicInteger(0)
+    private val lastUpdateMs = AtomicLong(0)
+    @Volatile
+    private var lastTotalHint: Int = -1
 
     fun snapshot(): List<FriendEntry> = byUin.values.toList()
 
-    fun clear() = byUin.clear()
+    fun size(): Int = byUin.size
+
+    fun clear() {
+        byUin.clear()
+        chunkCount.set(0)
+        lastTotalHint = -1
+    }
+
+    fun markRefreshStart() {
+        // Keep old data; new chunks merge. Optionally soft-clear if very stale.
+        Log.i("FriendListRespCache refresh start size=${byUin.size}")
+    }
+
+    fun put(uin: String, name: String, nick: String? = null) {
+        val n = UinUtil.normalize(uin) ?: return
+        val display = name.ifBlank { nick?.ifBlank { n } ?: n }
+        byUin[n] = FriendEntry(n, display, nick, FriendSource.API)
+        lastUpdateMs.set(System.currentTimeMillis())
+    }
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val cl = lpparam.classLoader
-        val respNames = listOf(
-            "friendlist.GetFriendListResp",
-            "friendlist/GetFriendListResp",
-            "com.tencent.mobileqq.friendlist.GetFriendListResp"
-        )
         var hooked = false
-        for (cn in respNames) {
-            val clazz = XposedHelpers.findClassIfExists(cn.replace('/', '.'), cl) ?: continue
-            try {
-                // Hook all readFrom methods
-                for (m in clazz.declaredMethods) {
-                    if (m.name != "readFrom" && m.name != "readFromCache") continue
+        for (cn in listOf(
+            "friendlist.GetFriendListResp",
+            "friendlist.GetFriendListRespV2"
+        )) {
+            val clazz = XposedHelpers.findClassIfExists(cn, cl) ?: continue
+            for (m in clazz.declaredMethods) {
+                if (m.name != "readFrom" && m.name != "readFromCache") continue
+                try {
                     XposedBridge.hookMethod(m, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
-                            try {
-                                parseResp(param.thisObject)
-                            } catch (t: Throwable) {
-                                Log.d("GetFriendListResp parse: ${t.message}")
-                            }
+                            runCatching { parseResp(param.thisObject) }
+                                .onFailure { Log.d("parseResp: ${it.message}") }
                         }
                     })
                     hooked = true
+                } catch (_: Throwable) {
                 }
-                if (hooked) {
-                    Log.i("Hooked GetFriendListResp: ${clazz.name}")
-                    break
-                }
-            } catch (t: Throwable) {
-                Log.d("hook $cn: ${t.message}")
+            }
+            try {
+                XposedBridge.hookAllConstructors(clazz, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        runCatching { parseResp(param.thisObject) }
+                    }
+                })
+            } catch (_: Throwable) {
+            }
+            if (hooked) {
+                Log.i("Hooked $cn for friend chunks")
+                break
             }
         }
-        if (!hooked) {
-            Log.w("GetFriendListResp not found — network cache disabled")
+        // Also hook FriendInfo materialization if present
+        val fi = XposedHelpers.findClassIfExists("friendlist.FriendInfo", cl)
+        if (fi != null) {
+            try {
+                for (m in fi.declaredMethods) {
+                    if (m.name != "readFrom") continue
+                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            runCatching {
+                                val uin = extractUin(param.thisObject) ?: return@runCatching
+                                val remark = fieldStr(param.thisObject, "remark")
+                                val nick = fieldStr(param.thisObject, "nick")
+                                    ?: fieldStr(param.thisObject, "name")
+                                put(
+                                    uin,
+                                    when {
+                                        !remark.isNullOrBlank() -> remark
+                                        !nick.isNullOrBlank() -> nick
+                                        else -> uin
+                                    },
+                                    nick
+                                )
+                            }
+                        }
+                    })
+                    Log.i("Hooked friendlist.FriendInfo.readFrom")
+                }
+            } catch (t: Throwable) {
+                Log.d("FriendInfo hook: ${t.message}")
+            }
         }
+        if (!hooked) Log.w("GetFriendListResp not found")
     }
 
     private fun parseResp(resp: Any) {
-        // Prefer vecFriendInfo list (QA FriendChunk)
+        chunkCount.incrementAndGet()
+        // total hint
+        for (fn in listOf("totoal_friend_count", "total_friend_count", "friend_count", "getfriendCount")) {
+            try {
+                val v = XposedHelpers.getObjectField(resp, fn)
+                val n = when (v) {
+                    is Number -> v.toInt()
+                    else -> v?.toString()?.toIntOrNull()
+                }
+                if (n != null && n > lastTotalHint) lastTotalHint = n
+            } catch (_: Throwable) {
+            }
+        }
+
+        // QA path: vecFriendInfo ArrayList of FriendInfo
         val list = runCatching {
             XposedHelpers.getObjectField(resp, "vecFriendInfo") as? List<*>
         }.getOrNull()
@@ -72,56 +140,81 @@ object FriendListRespCache {
                 val remark = fieldStr(info, "remark") ?: fieldStr(info, "strRemark")
                 val nick = fieldStr(info, "nick") ?: fieldStr(info, "strNick")
                     ?: fieldStr(info, "name")
-                val display = when {
-                    !remark.isNullOrBlank() -> remark
-                    !nick.isNullOrBlank() -> nick
-                    else -> uin
-                }
-                byUin[uin] = FriendEntry(uin, display, nick, FriendSource.API)
+                put(
+                    uin,
+                    when {
+                        !remark.isNullOrBlank() -> remark
+                        !nick.isNullOrBlank() -> nick
+                        else -> uin
+                    },
+                    nick
+                )
                 n++
             }
-            if (n > 0) Log.i("GetFriendListResp cached +$n total=${byUin.size}")
+            Log.i(
+                "GetFriendListResp chunk +$n totalCache=${byUin.size} " +
+                    "hintTotal=$lastTotalHint chunks=${chunkCount.get()}"
+            )
             return
         }
-        // Array style
-        val arrUin = runCatching { XposedHelpers.getObjectField(resp, "arrUin") }.getOrNull()
-        if (arrUin is LongArray) {
-            val remarks = runCatching { XposedHelpers.getObjectField(resp, "arrRemark") as? Array<*> }
-                .getOrNull()
-            val nicks = runCatching { XposedHelpers.getObjectField(resp, "arrNick") as? Array<*> }
-                .getOrNull()
-            for (i in arrUin.indices) {
-                val uin = UinUtil.normalize(arrUin[i].toString()) ?: continue
-                val remark = remarks?.getOrNull(i)?.toString()
-                val nick = nicks?.getOrNull(i)?.toString()
-                val display = when {
-                    !remark.isNullOrBlank() -> remark
-                    !nick.isNullOrBlank() -> nick
-                    else -> uin
+
+        // Field walk: any List of objects with friendUin
+        for (f in resp.javaClass.declaredFields) {
+            try {
+                f.isAccessible = true
+                val v = f.get(resp) ?: continue
+                if (v is List<*> && v.isNotEmpty()) {
+                    val sample = v.firstOrNull() ?: continue
+                    if (extractUin(sample) == null) continue
+                    var n = 0
+                    for (item in v) {
+                        if (item == null) continue
+                        val uin = extractUin(item) ?: continue
+                        val remark = fieldStr(item, "remark") ?: fieldStr(item, "strRemark")
+                        val nick = fieldStr(item, "nick") ?: fieldStr(item, "name")
+                        put(
+                            uin,
+                            when {
+                                !remark.isNullOrBlank() -> remark
+                                !nick.isNullOrBlank() -> nick
+                                else -> uin
+                            },
+                            nick
+                        )
+                        n++
+                    }
+                    if (n > 0) {
+                        Log.i("GetFriendListResp field ${f.name} +$n total=${byUin.size}")
+                    }
                 }
-                byUin[uin] = FriendEntry(uin, display, nick, FriendSource.API)
+                if (v is LongArray && v.isNotEmpty() && f.name.contains("uin", true)) {
+                    for (x in v) {
+                        UinUtil.normalize(x.toString())?.let { put(it, it) }
+                    }
+                }
+            } catch (_: Throwable) {
             }
-            Log.i("GetFriendListResp arrUin total=${byUin.size}")
         }
     }
 
     private fun extractUin(obj: Any): String? {
-        for (n in listOf("friendUin", "uin", "lFriendUIN", "uFriendUin")) {
-            fieldStr(obj, n)?.let { UinUtil.normalize(it) }?.let { return it }
+        for (n in listOf(
+            "friendUin", "uin", "lFriendUIN", "uFriendUin",
+            "uint64_friend_uin", "friend_uin"
+        )) {
             try {
                 val f = obj.javaClass.getField(n)
-                val v = f.get(obj)
-                UinUtil.normalize(v?.toString())?.let { return it }
+                UinUtil.normalize(f.get(obj)?.toString())?.let { return it }
             } catch (_: Throwable) {
             }
+            fieldStr(obj, n)?.let { UinUtil.normalize(it) }?.let { return it }
         }
         return null
     }
 
     private fun fieldStr(obj: Any, name: String): String? {
         return try {
-            val f = obj.javaClass.getField(name)
-            f.get(obj)?.toString()
+            obj.javaClass.getField(name).get(obj)?.toString()
         } catch (_: Throwable) {
             try {
                 XposedHelpers.getObjectField(obj, name)?.toString()
