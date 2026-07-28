@@ -3,9 +3,11 @@ package com.fuckqq.nullfriend.ui
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -122,6 +124,65 @@ class LauncherActivity : AppCompatActivity() {
             }
         }
         root.addView(btnSecondary, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        // ===== Footer: 作者 + 仓库 + GitHub 跳转 =====
+        root.addView(View(this).apply { setBackgroundColor(T.RULE) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 1).apply {
+                topMargin = dp(T.SP_6)
+            })
+
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(T.SP_4), 0, 0)
+        }
+        // GitHub 图标（用 ◴ 近似 + 标签）
+        val ghIcon = TextView(this).apply {
+            text = "◴"
+            setTextColor(T.SIGNAL)
+            textSize = T.TEXT_TITLE
+            setPadding(0, 0, dp(T.SP_2), 0)
+        }
+        footer.addView(ghIcon)
+        // 作者 + 仓库信息
+        val infoCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        infoCol.addView(TextView(this).apply {
+            text = "作者 NekoMirra"
+            setTextColor(T.TEXT_2)
+            textSize = T.TEXT_CAPTION
+            typeface = T.typefaceMono()
+        })
+        infoCol.addView(TextView(this).apply {
+            text = "github.com/NekoMirra/FuckQQ-NullFriend"
+            setTextColor(T.TEXT_3)
+            textSize = T.TEXT_MICRO
+            typeface = T.typefaceMono()
+            setPadding(0, dp(2f), 0, 0)
+        })
+        footer.addView(infoCol)
+        // 跳转箭头
+        footer.addView(TextView(this).apply {
+            text = "↗"
+            setTextColor(T.TEXT_2)
+            textSize = T.TEXT_TITLE
+            setPadding(dp(T.SP_2), 0, 0, 0)
+        })
+        footer.isClickable = true
+        footer.isFocusable = true
+        footer.background = T.ripple(T.SURFACE, T.RADIUS_NONE, this, T.RULE)
+        footer.setOnClickListener {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/NekoMirra/FuckQQ-NullFriend")))
+            } catch (t: Throwable) {
+                Toast.makeText(this, t.message ?: "无法打开", Toast.LENGTH_SHORT).show()
+            }
+        }
+        root.addView(footer, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
 

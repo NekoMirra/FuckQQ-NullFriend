@@ -218,7 +218,7 @@ class DetectorActivity : AppCompatActivity() {
             (v as TextView).text = if (prefs.notifyEnabled) "通知 ON" else "通知 OFF"
         }
         // 定时检查按钮：首刷建基线后才可用
-        btnTimer = btn(intervalLabel(prefs.intervalMinutes), true, false) {}
+        btnTimer = btn("定时：" + intervalLabel(prefs.intervalMinutes), true, false) {}
         val btnFilter = btn("全部", true, false) { v ->
             currentFilter = if (currentFilter == 0) 1 else 0
             (v as TextView).text = if (currentFilter == 1) "未读" else "全部"
@@ -326,7 +326,7 @@ class DetectorActivity : AppCompatActivity() {
             })
             row.setOnClickListener {
                 prefs.intervalMinutes = intervalValues[idx]
-                btnTimer.text = item
+                btnTimer.text = "定时：" + item
                 detectionService?.reschedulePeriodic()
                 intervalPopup?.dismiss()
                 Toast.makeText(this,

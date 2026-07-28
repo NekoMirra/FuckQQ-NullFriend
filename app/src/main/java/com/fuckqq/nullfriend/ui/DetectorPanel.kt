@@ -181,7 +181,7 @@ object DetectorPanel {
         }
         val actions = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         val btnNotify = makeBtn(activity, if (prefs.notifyEnabled) "通知 ON" else "通知 OFF", false, false) {}
-        val btnInterval = makeBtn(activity, intervalLabel(prefs.intervalMinutes), false, false) {}
+        val btnInterval = makeBtn(activity, "定时：" + intervalLabel(prefs.intervalMinutes), false, false) {}
         val btnFilter = makeBtn(activity, "全部", false, false) {}
         val btnExport = makeBtn(activity, "导出", false, false) {}
         val btnClear = makeBtn(activity, "清空", false, false) {}
@@ -356,7 +356,7 @@ object DetectorPanel {
                 val idx = intervalLabels.indexOf(picked)
                 if (idx >= 0) {
                     prefs.intervalMinutes = intervalValues[idx]
-                    btnInterval.text = picked
+                    btnInterval.text = "定时：" + picked
                     service.reschedulePeriodic()
                     toast(activity, if (intervalValues[idx] == 0) "已关闭定时检查" else "定时检查：每 $picked")
                 }
