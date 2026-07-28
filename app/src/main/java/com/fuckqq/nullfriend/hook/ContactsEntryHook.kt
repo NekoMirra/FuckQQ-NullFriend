@@ -144,6 +144,7 @@ object ContactsEntryHook {
         // 右侧未读计数角标
         val badge = TextView(activity).apply {
             id = View.generateViewId()
+            tag = "fuckqq_nullfriend_badge"
             text = "0"
             setTextColor(T.INK)
             textSize = T.TEXT_MICRO
@@ -200,6 +201,7 @@ object ContactsEntryHook {
                 val owners = ModuleMain.repository.listAccounts().map { it.ownerUin }
                 val unread = owners.sumOf { ModuleMain.repository.unreadCount(it) }
                 activity.runOnUiThread {
+                    if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
                     if (unread > 0) {
                         badge.text = if (unread > 99) "99+" else unread.toString()
                         badge.visibility = View.VISIBLE
@@ -233,6 +235,22 @@ object ContactsEntryHook {
             m.invoke(lv, footer)
         } catch (t: Throwable) {
             Log.e("invokeAddFooterView failed", t)
+        }
+    }
+
+    /**
+     * 面板关闭后调用，刷新所有已注入 footer 的未读角标。
+     * 在 QQ 进程内任意 Activity 上触发，遍历缓存的 footer 视图更新角标。
+     */
+    fun refreshBadges() {
+        try {
+            for (lv in addedViews) {
+                val foot = lv.findViewWithTag<View>(FOOTER_TAG) ?: continue
+                val badge = foot.findViewWithTag<TextView>("fuckqq_nullfriend_badge") ?: continue
+                refreshBadgeAsync(lv.context as? Activity ?: continue, badge)
+            }
+        } catch (t: Throwable) {
+            Log.d("refreshBadges: ${t.message}")
         }
     }
 

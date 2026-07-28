@@ -1,6 +1,20 @@
-# 去TM的单向好友
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NekoMirra/FuckQQ-NullFriend/master/docs/icon.svg" width="96" height="96" alt="icon" />
+</p>
+
+<h1 align="center">去TM的单向好友</h1>
+
+<p align="center">
+  <a href="https://github.com/NekoMirra/FuckQQ-NullFriend/releases"><img src="https://img.shields.io/github/v/release/NekoMirra/FuckQQ-NullFriend?display_name=tag&style=flat-square&label=%E7%89%88%E6%9C%AC" alt="version"></a>
+  <a href="https://github.com/NekoMirra/FuckQQ-NullFriend/releases"><img src="https://img.shields.io/github/downloads/NekoMirra/FuckQQ-NullFriend/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD%E9%87%8F" alt="downloads"></a>
+  <a href="https://github.com/NekoMirra/FuckQQ-NullFriend/stargazers"><img src="https://img.shields.io/github/stars/NekoMirra/FuckQQ-NullFriend?style=flat-square&label=%E6%98%9F%E6%A0%87" alt="stars"></a>
+  <a href="https://github.com/NekoMirra/FuckQQ-NullFriend/network/members"><img src="https://img.shields.io/github/forks/NekoMirra/FuckQQ-NullFriend?style=flat-square&label=%E5%A4%8D%E5%88%BB" alt="forks"></a>
+  <img src="https://img.shields.io/badge/Android-8.0%2B-18D1FF?style=flat-square" alt="android">
+  <img src="https://img.shields.io/badge/License-MIT-0E8FB5?style=flat-square" alt="license">
+</p>
 
 **介绍**
+
 整了一个检测QQ单向好友（是否被删除）的Lsposed模块，用于弥补QAuxiliary的「历史好友」检测功能在QQ NT失效已久的遗憾，解决社交场合中的人情世故
 
 工作原理十分简单

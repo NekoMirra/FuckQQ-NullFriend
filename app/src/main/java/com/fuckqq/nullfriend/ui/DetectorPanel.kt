@@ -70,7 +70,11 @@ object DetectorPanel {
                 val root = buildRoot(activity) { dialog.dismiss() }
                 dialog.setContentView(root)
                 dialog.setCancelable(true)
-                dialog.setOnDismissListener { openDialog = null }
+                dialog.setOnDismissListener {
+                    openDialog = null
+                    // 面板关闭后刷新联系人列表底部入口的未读角标
+                    try { com.fuckqq.nullfriend.hook.ContactsEntryHook.refreshBadges() } catch (_: Throwable) {}
+                }
 
                 dialog.window?.apply {
                     val T = UiTheme
