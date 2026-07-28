@@ -4,11 +4,13 @@ import android.app.Application
 import android.content.Context
 import com.fuckqq.nullfriend.data.DetectorRepository
 import com.fuckqq.nullfriend.data.Prefs
+import com.fuckqq.nullfriend.hook.ContactsEntryHook
 import com.fuckqq.nullfriend.hook.SettingsInjectHook
 import com.fuckqq.nullfriend.hook.StartupHook
 import com.fuckqq.nullfriend.provider.FriendListRespCache
 import com.fuckqq.nullfriend.provider.FriendRoster
 import com.fuckqq.nullfriend.provider.HybridFriendListProvider
+import com.fuckqq.nullfriend.provider.NtBuddyProvider
 import com.fuckqq.nullfriend.service.DetectionService
 import com.fuckqq.nullfriend.service.Notifier
 import com.fuckqq.nullfriend.util.Log
@@ -44,11 +46,14 @@ object ModuleMain {
         Log.i("Loading in ${lpparam.packageName} process=${lpparam.processName}")
 
         if (hooksInstalled.compareAndSet(false, true)) {
-            // QA-style: hook GetFriendListResp + maintain full roster
+            // NT 架构: IKernelService -> BuddyService.getBuddyListV2 (primary)
+            NtBuddyProvider.install(lpparam.classLoader)
+            // 旧 QQ 8.x 路径兜底 (legacy)
             FriendRoster.install(lpparam)
             FriendListRespCache.install(lpparam) // delegates to FriendRoster
             hookApplicationCreate(lpparam)
             SettingsInjectHook.install(lpparam)
+            ContactsEntryHook.install(lpparam)
             StartupHook.install(lpparam)
         }
     }

@@ -19,3 +19,4 @@ out/
 .kotlin/
 
 local.properties
+.ace-tool/

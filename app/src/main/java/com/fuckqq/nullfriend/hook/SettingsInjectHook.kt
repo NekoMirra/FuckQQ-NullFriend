@@ -1,7 +1,6 @@
 package com.fuckqq.nullfriend.hook
 
 import android.app.Activity
-import android.content.Intent
 import com.fuckqq.nullfriend.Constants
 import com.fuckqq.nullfriend.ModuleMain
 import com.fuckqq.nullfriend.ui.DetectorPanel
@@ -12,25 +11,16 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.WeakHashMap
 
 /**
- * Injects a floating entry on common QQ activities and opens in-process panel.
+ * 不再注入全局悬浮窗。
+ *
+ * 入口已改为「嵌入 QQ 联系人列表底部」（见 ContactsEntryHook）。
+ * 本 Hook 仅保留从桌面启动器经 Intent 唤起面板的能力：
+ *  - 桌面 LauncherActivity 携带 EXTRA_OPEN_PANEL 启动 QQ
+ *  - QQ 任一主界面 onResume 时消费该 extra 并打开进程内面板
  */
 object SettingsInjectHook {
 
-    /** Prefer main shell / me / contacts / settings; avoid pure AIO chat spam if possible */
-    private val preferHints = listOf(
-        "Splash", "Main", "Frame", "Home", "Tab",
-        "Setting", "About", "Leba", "Contact", "Friend",
-        "Mine", "Profile", "Account", "QQSetting", "Drawer",
-        "Conversation", "Recent", "Login", "Gesture"
-    )
-
-    /** Always inject on these strong matches */
-    private val alwaysHints = listOf(
-        "SplashActivity", "MainActivity", "MainFragmentActivity",
-        "QQSetting", "SettingsActivity", "SettingActivity"
-    )
-
-    private val attached = WeakHashMap<Activity, Boolean>()
+    private val handled = WeakHashMap<Activity, Boolean>()
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
@@ -41,12 +31,11 @@ object SettingsInjectHook {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val activity = param.thisObject as? Activity ?: return
                         if (activity.packageName != Constants.QQ_PACKAGE) return
-                        maybeAttach(activity)
                         maybeOpenFromIntent(activity)
                     }
                 }
             )
-            // Also onCreate for early attach
+            // onCreate 后也尝试一次，便于早绑定
             XposedHelpers.findAndHookMethod(
                 Activity::class.java,
                 "onPostCreate",
@@ -55,33 +44,14 @@ object SettingsInjectHook {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val activity = param.thisObject as? Activity ?: return
                         if (activity.packageName != Constants.QQ_PACKAGE) return
-                        maybeAttach(activity)
                         maybeOpenFromIntent(activity)
                     }
                 }
             )
-            Log.i("SettingsInjectHook installed (FAB + intent)")
+            Log.i("SettingsInjectHook installed (intent-only, no FAB)")
         } catch (t: Throwable) {
             Log.e("SettingsInjectHook failed", t)
         }
-    }
-
-    private fun maybeAttach(activity: Activity) {
-        val name = activity.javaClass.name
-        val noisy = name.contains("WebView", true) ||
-            name.contains("Translucent", true) ||
-            name.contains("Proxy", true) ||
-            name.contains("Dialog", true) ||
-            name.contains("Plugin", true)
-        if (noisy) return
-
-        val strong = alwaysHints.any { name.contains(it, ignoreCase = true) }
-        val soft = preferHints.any { name.contains(it, ignoreCase = true) }
-        // Only attach on main shell / settings-like pages (not every chat Activity)
-        if (!strong && !soft) return
-        if (attached.put(activity, true) == true) return
-        ModuleMain.ensureInit(activity.applicationContext)
-        DetectorPanel.attachFab(activity)
     }
 
     private fun maybeOpenFromIntent(activity: Activity) {
@@ -91,7 +61,8 @@ object SettingsInjectHook {
                 intent.action == ACTION_OPEN_PANEL ||
                 intent.getStringExtra("open_nullfriend") == "1"
             if (!open) return
-            // consume
+            if (handled.put(activity, true) == true) return
+            // consume，避免反复弹
             intent.removeExtra(EXTRA_OPEN_PANEL)
             intent.removeExtra("open_nullfriend")
             ModuleMain.ensureInit(activity.applicationContext)

@@ -295,6 +295,38 @@ class DetectorRepository(context: Context) {
         dbHelper.writableDatabase.update("deletion_history", values, "id=?", arrayOf(id.toString()))
     }
 
+    fun markAllRead(ownerUin: String) {
+        val values = ContentValues().apply { put("read", 1) }
+        dbHelper.writableDatabase.update("deletion_history", values, "owner_uin=?", arrayOf(ownerUin))
+    }
+
+    fun unreadCount(ownerUin: String): Int {
+        dbHelper.readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM deletion_history WHERE owner_uin=? AND read=0",
+            arrayOf(ownerUin)
+        ).use { c ->
+            if (c.moveToFirst()) return c.getInt(0)
+        }
+        return 0
+    }
+
+    /** 导出被删记录为可分享文本 */
+    fun exportHistoryText(ownerUin: String): String {
+        val list = listHistory(ownerUin, 2000)
+        if (list.isEmpty()) return "暂无被删记录"
+        val sb = StringBuilder()
+        sb.appendLine("去TM的单向好友 · 被删记录")
+        sb.appendLine("账号: $ownerUin")
+        sb.appendLine("共 ${list.size} 条")
+        sb.appendLine()
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA)
+        list.forEachIndexed { i, r ->
+            sb.appendLine("${i + 1}. ${r.friendName} (${r.friendUin})")
+            sb.appendLine("   检测时间: ${fmt.format(java.util.Date(r.detectedAt))}")
+        }
+        return sb.toString()
+    }
+
     fun setLastError(ownerUin: String, error: String?) {
         val existing = getAccount(ownerUin)
         upsertAccount(
