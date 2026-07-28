@@ -103,7 +103,7 @@ class Notifier(private val context: Context) {
             "好友消失提醒",
             NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
-            description = "去TM的单向好友：好友列表减少时提醒（可在模块内关闭）"
+            description = "好友列表减少时提醒"
             setShowBadge(true)
         }
         nm.createNotificationChannel(channel)

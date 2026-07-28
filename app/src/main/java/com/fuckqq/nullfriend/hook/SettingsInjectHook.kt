@@ -11,12 +11,11 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.WeakHashMap
 
 /**
- * 不再注入全局悬浮窗。
+ * 桌面启动器经 Intent 唤起进程内面板的入口。
  *
- * 入口已改为「嵌入 QQ 联系人列表底部」（见 ContactsEntryHook）。
- * 本 Hook 仅保留从桌面启动器经 Intent 唤起面板的能力：
- *  - 桌面 LauncherActivity 携带 EXTRA_OPEN_PANEL 启动 QQ
- *  - QQ 任一主界面 onResume 时消费该 extra 并打开进程内面板
+ * - 桌面 LauncherActivity 携带 EXTRA_OPEN_PANEL 启动 QQ
+ * - QQ 任一主界面 onResume 时消费该 extra 并打开进程内面板
+ * - 联系人列表底部入口由 ContactsEntryHook 负责
  */
 object SettingsInjectHook {
 

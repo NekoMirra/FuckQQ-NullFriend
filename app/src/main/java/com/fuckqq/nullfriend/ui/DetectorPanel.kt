@@ -258,7 +258,7 @@ object DetectorPanel {
 
         fun bindAccounts() {
             if (accounts.isEmpty()) {
-                accountTrigger.text = "暂无账号 · 先点刷新"
+                accountTrigger.text = "暂无账号，请先刷新"
                 selected = null
             } else {
                 val pos = accounts.indexOf(selected).let { if (it >= 0) it else 0 }

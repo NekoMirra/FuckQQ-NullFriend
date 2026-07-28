@@ -126,7 +126,7 @@ class DetectorActivity : AppCompatActivity() {
         repository = DetectorRepository(this)
         detectionService = null
         injectedMode = false
-        statusText.text = "模块未注入 QQ 进程：仅可浏览本进程数据。请从 QQ 内入口打开。"
+        statusText.text = "模块未注入 QQ 进程，仅可浏览本进程数据。请从 QQ 内入口打开。"
     }
 
     private fun buildStats() {
@@ -363,7 +363,7 @@ class DetectorActivity : AppCompatActivity() {
     private fun reloadUi() {
         val list = repository.listAccounts()
         accounts = list.map { it.ownerUin }.distinct()
-        accountSelector.options(if (accounts.isEmpty()) listOf("暂无账号 · 先点刷新") else accounts,
+        accountSelector.options(if (accounts.isEmpty()) listOf("暂无账号，请先刷新") else accounts,
             current = selectedOwner ?: accounts.firstOrNull())
         val want = selectedOwner ?: prefs.uiSelectedOwnerUin ?: accounts.firstOrNull()
         if (accounts.isNotEmpty()) {
